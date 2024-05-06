@@ -1,110 +1,73 @@
-# Copyright 2023 Canonical Ltd.
+# Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Types used by both RunnerManager and Runner classes."""
+"""Types used by Runner class."""
 
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Optional, TypedDict, Union
+from typing import Optional
 
-import jinja2
-from ghapi.all import GhApi
-
-from lxd import LxdClient
-from repo_policy_compliance_client import RepoPolicyComplianceClient
+from charm_state import GithubPath, SSHDebugConnection
 
 
 @dataclass
 class RunnerByHealth:
-    """Set of runners LXD instance by health state."""
+    """Set of runners LXD instance by health state.
+
+    Attributes:
+        healthy: Runners that are correctly running runner script.
+        unhealthy: Runners that are not running runner script.
+    """
 
     healthy: tuple[str]
     unhealthy: tuple[str]
 
 
-class ProxySetting(TypedDict, total=False):
-    """Represent HTTP-related proxy settings."""
-
-    no_proxy: str
-    http: str
-    https: str
-    aproxy_address: str
-
-
 @dataclass
-class GitHubRepo:
-    """Represent GitHub repository."""
-
-    owner: str
-    repo: str
-
-    def path(self) -> str:
-        """Return a string representing the path."""
-        return f"{self.owner}/{self.repo}"
-
-
-@dataclass
-class GitHubOrg:
-    """Represent GitHub organization."""
-
-    org: str
-    group: str
-
-    def path(self) -> str:
-        """Return a string representing the path."""
-        return self.org
-
-
-GitHubPath = Union[GitHubOrg, GitHubRepo]
-
-
-class VirtualMachineResources(NamedTuple):
-    """Virtual machine resource configuration."""
-
-    cpu: int
-    memory: str
-    disk: str
-
-
-@dataclass
-class RunnerClients:
-    """Clients for accessing various services.
+class ProxySetting:
+    """Represent HTTP-related proxy settings.
 
     Attributes:
-        github: Used to query GitHub API.
-        jinja: Used for templating.
-        lxd: Used to interact with LXD API.
+        no_proxy: The comma separated URLs to not go through proxy.
+        http: HTTP proxy URL.
+        https: HTTPS proxy URL.
+        aproxy_address: Aproxy URL.
     """
 
-    github: GhApi
-    jinja: jinja2.Environment
-    lxd: LxdClient
-    repo: RepoPolicyComplianceClient
+    no_proxy: Optional[str]
+    http: Optional[str]
+    https: Optional[str]
+    aproxy_address: Optional[str]
 
 
 @dataclass
-class RunnerConfig:
+# The instance attributes are all required and is better standalone each.
+class RunnerConfig:  # pylint: disable=too-many-instance-attributes
     """Configuration for runner.
 
     Attributes:
-        name: Name of the runner.
         app_name: Application name of the charm.
+        issue_metrics: Whether to issue metrics.
+        labels: Custom runner labels.
+        lxd_storage_path: Path to be used as LXD storage.
+        name: Name of the runner.
         path: GitHub repository path in the format '<owner>/<repo>', or the GitHub organization
             name.
         proxies: HTTP(S) proxy settings.
-        lxd_storage_path: Path to be used as LXD storage.
-        issue_metrics: Whether to issue metrics.
         dockerhub_mirror: URL of dockerhub mirror to use.
+        ssh_debug_connections: The SSH debug server connections metadata.
     """
 
-    name: str
     app_name: str
-    path: GitHubPath
-    proxies: ProxySetting
-    lxd_storage_path: Path
     issue_metrics: bool
+    labels: tuple[str]
+    lxd_storage_path: Path
+    name: str
+    path: GithubPath
+    proxies: ProxySetting
     dockerhub_mirror: str | None = None
+    ssh_debug_connections: list[SSHDebugConnection] | None = None
 
 
 @dataclass
@@ -112,6 +75,7 @@ class RunnerStatus:
     """Status of runner.
 
     Attributes:
+        runner_id: ID of the runner.
         exist: Whether the runner instance exists on LXD.
         online: Whether GitHub marks this runner as online.
         busy: Whether GitHub marks this runner as busy.

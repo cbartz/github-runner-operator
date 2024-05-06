@@ -1,4 +1,4 @@
-# Copyright 2023 Canonical Ltd.
+# Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Test cases of RunnerManager class."""
@@ -11,17 +11,29 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 import shared_fs
-from charm_state import State
+from charm_state import (
+    Arch,
+    CharmConfig,
+    CharmState,
+    GithubOrg,
+    GithubRepo,
+    ProxyConfig,
+    VirtualMachineResources,
+)
 from errors import IssueMetricEventError, RunnerBinaryError
+from github_type import RunnerApplication
 from metrics import Reconciliation, RunnerInstalled, RunnerStart, RunnerStop
 from runner import Runner, RunnerStatus
-from runner_manager import RunnerManager, RunnerManagerConfig
+from runner_manager import BUILD_IMAGE_SCRIPT_FILENAME, RunnerManager, RunnerManagerConfig
 from runner_metrics import RUNNER_INSTALLED_TS_FILE_NAME
-from runner_type import GitHubOrg, GitHubRepo, RunnerByHealth, VirtualMachineResources
+from runner_type import RunnerByHealth
 from shared_fs import SharedFilesystem
-from tests.unit.mock import TEST_BINARY
+from tests.unit.mock import TEST_BINARY, MockLxdImageManager
+
+IMAGE_NAME = "jammy"
 
 RUNNER_MANAGER_TIME_MODULE = "runner_manager.time.time"
+TEST_PROXY_SERVER_URL = "http://proxy.server:1234"
 
 
 @pytest.fixture(scope="function", name="token")
@@ -29,10 +41,21 @@ def token_fixture():
     return secrets.token_hex()
 
 
+@pytest.fixture(scope="function", name="charm_config")
+def charm_config_fixture():
+    """Mock charm config instance."""
+    mock_charm_config = MagicMock(spec=CharmConfig)
+    mock_charm_config.labels = ("test",)
+    return mock_charm_config
+
+
 @pytest.fixture(scope="function", name="charm_state")
-def charm_state_fixture():
-    mock = MagicMock(spec=State)
+def charm_state_fixture(charm_config: MagicMock):
+    mock = MagicMock(spec=CharmState)
     mock.is_metrics_logging_available = False
+    mock.arch = Arch.X64
+    mock.ssh_debug_connections = None
+    mock.charm_config = charm_config
     return mock
 
 
@@ -40,14 +63,20 @@ def charm_state_fixture():
     scope="function",
     name="runner_manager",
     params=[
-        (GitHubOrg("test_org", "test_group"), {}),
+        (GithubOrg("test_org", "test_group"), ProxyConfig()),
         (
-            GitHubRepo("test_owner", "test_repo"),
-            {"no_proxy": "test_no_proxy", "http": "test_http", "https": "test_https"},
+            GithubRepo("test_owner", "test_repo"),
+            ProxyConfig(
+                no_proxy="test_no_proxy",
+                http=TEST_PROXY_SERVER_URL,
+                https=TEST_PROXY_SERVER_URL,
+                use_aproxy=False,
+            ),
         ),
     ],
 )
 def runner_manager_fixture(request, tmp_path, monkeypatch, token, charm_state):
+    charm_state.proxy_config = request.param[1]
     monkeypatch.setattr(
         "runner_manager.RunnerManager.runner_bin_path", tmp_path / "mock_runner_binary"
     )
@@ -58,14 +87,13 @@ def runner_manager_fixture(request, tmp_path, monkeypatch, token, charm_state):
         "test app",
         "0",
         RunnerManagerConfig(
-            request.param[0],
-            token,
-            "jammy",
-            secrets.token_hex(16),
-            pool_path,
+            path=request.param[0],
+            token=token,
+            image=IMAGE_NAME,
+            service_token=secrets.token_hex(16),
+            lxd_storage_path=pool_path,
             charm_state=charm_state,
         ),
-        proxies=request.param[1],
     )
     runner_manager.runner_bin_path.write_bytes(TEST_BINARY)
     return runner_manager
@@ -96,27 +124,48 @@ def runner_metrics_fixture(monkeypatch: MonkeyPatch) -> MagicMock:
     return runner_metrics_mock
 
 
-def test_get_latest_runner_bin_url(runner_manager: RunnerManager):
+@pytest.mark.parametrize(
+    "arch",
+    [
+        pytest.param(Arch.ARM64),
+        pytest.param(Arch.X64),
+    ],
+)
+def test_get_latest_runner_bin_url(runner_manager: RunnerManager, arch: Arch, charm_state):
     """
     arrange: Nothing.
     act: Get runner bin url of existing binary.
     assert: Correct mock data returned.
     """
-    runner_bin = runner_manager.get_latest_runner_bin_url(os_name="linux", arch_name="x64")
+    charm_state.arch = arch
+    mock_gh_client = MagicMock()
+    app = RunnerApplication(
+        os="linux",
+        architecture=arch.value,
+        download_url=(download_url := "https://www.example.com"),
+        filename=(filename := "test_runner_binary"),
+    )
+    mock_gh_client.get_runner_application.return_value = app
+    runner_manager._clients.github = mock_gh_client
+
+    runner_bin = runner_manager.get_latest_runner_bin_url(os_name="linux")
     assert runner_bin["os"] == "linux"
-    assert runner_bin["architecture"] == "x64"
-    assert runner_bin["download_url"] == "https://www.example.com"
-    assert runner_bin["filename"] == "test_runner_binary"
+    assert runner_bin["architecture"] == arch.value
+    assert runner_bin["download_url"] == download_url
+    assert runner_bin["filename"] == filename
 
 
 def test_get_latest_runner_bin_url_missing_binary(runner_manager: RunnerManager):
     """
-    arrange: Nothing.
+    arrange: Given a mocked GH API client that does not return any runner binaries.
     act: Get runner bin url of non-existing binary.
     assert: Error related to runner bin raised.
     """
+    runner_manager._clients.github = MagicMock()
+    runner_manager._clients.github.get_runner_application.side_effect = RunnerBinaryError
+
     with pytest.raises(RunnerBinaryError):
-        runner_manager.get_latest_runner_bin_url(os_name="not_exist", arch_name="not_exist")
+        runner_manager.get_latest_runner_bin_url(os_name="not_exist")
 
 
 def test_update_runner_bin(runner_manager: RunnerManager):
@@ -127,16 +176,33 @@ def test_update_runner_bin(runner_manager: RunnerManager):
     """
 
     class MockRequestLibResponse:
-        def __init__(self, *arg, **kargs):
+        """A mock requests library response."""
+
+        def __init__(self, *args, **kwargs):
+            """Initialize successful requests library response.
+
+            Args:
+                args: Placeholder for positional arguments.
+                kwargs: Placeholder for keyword arguments.
+            """
             self.status_code = 200
 
-        def iter_content(self, *arg, **kargs):
+        def iter_content(self, *args, **kwargs):
+            """Mock content iterator returning an iterator over a single test runner binary.
+
+            Args:
+                args: Placeholder positional arguments.
+                kwargs: Placeholder keyword arguments.
+
+            Returns:
+                An iterator over a single test runner binary.
+            """
             return iter([TEST_BINARY])
 
     runner_manager.runner_bin_path.unlink(missing_ok=True)
 
     runner_manager.session.get = MockRequestLibResponse
-    runner_bin = runner_manager.get_latest_runner_bin_url(os_name="linux", arch_name="x64")
+    runner_bin = runner_manager.get_latest_runner_bin_url(os_name="linux")
 
     runner_manager.update_runner_bin(runner_bin)
 
@@ -175,7 +241,11 @@ def test_reconcile_remove_runner(runner_manager: RunnerManager):
     """
 
     def mock_get_runners():
-        """Create three mock runners."""
+        """Create three mock runners.
+
+        Returns:
+            Three mock runners.
+        """
         runners = []
         for _ in range(3):
             # 0 is a mock runner id.
@@ -295,41 +365,68 @@ def test_reconcile_issues_reconciliation_metric_event(
     runner_manager: RunnerManager,
     monkeypatch: MonkeyPatch,
     issue_event_mock: MagicMock,
-    charm_state: MagicMock,
     runner_metrics: MagicMock,
+    charm_state: MagicMock,
 ):
     """
-    arrange:
-        - Enable issuing of metrics
-        - Mock timestamps
-        - The result of runner_metrics.extract
-        - Create three online runners , where two are idle
+    arrange: \
+        - Enable issuing of metrics \
+        - Mock timestamps \
+        - Mock the result of runner_metrics.issue_event to contain 2 RunnerStart and 1 RunnerStop \
+            events, meaning one runner was active and one crashed. \
+        - Create two online runners , one active and one idle.
     act: Reconcile.
-    assert: The expected event is issued.
+    assert: The expected event is issued. We expect two idle runners and one crashed runner
+     to be reported.
     """
     charm_state.is_metrics_logging_available = True
     t_mock = MagicMock(return_value=12345)
     monkeypatch.setattr(RUNNER_MANAGER_TIME_MODULE, t_mock)
-    runner_metrics.extract.return_value = {RunnerStart: 3, RunnerStop: 1}
+    runner_metrics.extract.return_value = (MagicMock() for _ in range(2))
+    runner_metrics.issue_events.side_effect = [{RunnerStart, RunnerStop}, {RunnerStart}]
+
+    online_idle_runner_name = f"{runner_manager.instance_name}-0"
+    offline_idle_runner_name = f"{runner_manager.instance_name}-1"
+    active_runner_name = f"{runner_manager.instance_name}-2"
 
     def mock_get_runners():
-        """Create three mock runners where one is busy."""
+        """Create three mock runners where one is busy.
+
+        Returns:
+            Mock runners with one busy runner.
+        """
         runners = []
-        for i in range(3):
-            # 0 is a mock runner id.
-            status = RunnerStatus(0, True, True, False if i < 2 else True)
-            runners.append(Runner(MagicMock(), MagicMock(), status, None))
+
+        online_idle_runner = RunnerStatus(runner_id=0, exist=True, online=True, busy=False)
+        offline_idle_runner = RunnerStatus(runner_id=1, exist=True, online=False, busy=False)
+        active_runner = RunnerStatus(runner_id=2, exist=True, online=True, busy=True)
+
+        for runner_status, runner_config in zip(
+            (online_idle_runner, offline_idle_runner, active_runner),
+            (online_idle_runner_name, offline_idle_runner_name, active_runner_name),
+        ):
+            config = MagicMock()
+            config.name = runner_config
+            runners.append(
+                Runner(
+                    clients=MagicMock(),
+                    runner_config=config,
+                    runner_status=runner_status,
+                    instance=None,
+                )
+            )
+
         return runners
 
     # Create online runners.
     runner_manager._get_runners = mock_get_runners
     runner_manager._get_runner_health_states = lambda: RunnerByHealth(
-        (
-            f"{runner_manager.instance_name}-0",
-            f"{runner_manager.instance_name}-1",
-            f"{runner_manager.instance_name}-2",
+        healthy=(
+            online_idle_runner_name,
+            offline_idle_runner_name,
+            active_runner_name,
         ),
-        (),
+        unhealthy=(),
     )
 
     runner_manager.reconcile(
@@ -340,9 +437,8 @@ def test_reconcile_issues_reconciliation_metric_event(
         event=Reconciliation(
             timestamp=12345,
             flavor=runner_manager.app_name,
-            crashed_runners=2,
+            crashed_runners=1,
             idle_runners=2,
-            active_runners=1,
             duration=0,
         )
     )
@@ -356,8 +452,8 @@ def test_reconcile_places_timestamp_in_newly_created_runner(
     charm_state: MagicMock,
 ):
     """
-    arrange: Enable issuing of metrics, mock timestamps and
-        create the directory for the shared filesystem.
+    arrange: Enable issuing of metrics, mock timestamps and create the directory for the shared\
+        filesystem.
     act: Reconcile to create a runner.
     assert: The expected timestamp is placed in the shared filesystem.
     """
@@ -379,7 +475,7 @@ def test_reconcile_error_on_placing_timestamp_is_ignored(
     runner_manager: RunnerManager, shared_fs: MagicMock, tmp_path: Path, charm_state: MagicMock
 ):
     """
-    arrange: Enable issuing of metrics and do not create the directory for the shared filesystem
+    arrange: Enable issuing of metrics and do not create the directory for the shared filesystem\
         in order to let a FileNotFoundError to be raised inside the RunnerManager.
     act: Reconcile to create a runner.
     assert: No exception is raised.
@@ -410,3 +506,51 @@ def test_reconcile_places_no_timestamp_in_newly_created_runner_if_metrics_disabl
     runner_manager.reconcile(1, VirtualMachineResources(2, "7GiB", "10Gib"))
 
     assert not (fs.path / RUNNER_INSTALLED_TS_FILE_NAME).exists()
+
+
+def test_schedule_build_runner_image(
+    runner_manager: RunnerManager,
+    tmp_path: Path,
+    charm_state: CharmState,
+    monkeypatch: MonkeyPatch,
+):
+    """
+    arrange: Mock the cron path and the randint function.
+    act: Schedule the build runner image.
+    assert: The cron file is created with the expected content.
+    """
+    runner_manager.cron_path = tmp_path / "cron"
+    runner_manager.cron_path.mkdir()
+    monkeypatch.setattr(random, "randint", MagicMock(spec=random.randint, return_value=4))
+
+    runner_manager.schedule_build_runner_image()
+
+    cronfile = runner_manager.cron_path / "build-runner-image"
+    http = charm_state.proxy_config.http or "''"
+    https = charm_state.proxy_config.https or "''"
+    no_proxy = charm_state.proxy_config.no_proxy or "''"
+
+    cmd = f"/usr/bin/bash {BUILD_IMAGE_SCRIPT_FILENAME.absolute()} {http} {https} {no_proxy}"
+
+    assert cronfile.exists()
+    assert cronfile.read_text() == f"4 4,10,16,22 * * * ubuntu {cmd} jammy\n"
+
+
+def test_has_runner_image(runner_manager: RunnerManager):
+    """
+    arrange: Multiple setups.
+        1. no runner image exists.
+        2. runner image with wrong name exists.
+        3. runner image with correct name exists.
+    act: Check if runner image exists.
+    assert:
+        1 and 2. False is returned.
+        3. True is returned.
+    """
+    assert not runner_manager.has_runner_image()
+
+    runner_manager._clients.lxd.images = MockLxdImageManager({"hirsute"})
+    assert not runner_manager.has_runner_image()
+
+    runner_manager._clients.lxd.images = MockLxdImageManager({IMAGE_NAME})
+    assert runner_manager.has_runner_image()

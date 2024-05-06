@@ -1,4 +1,4 @@
-# Copyright 2023 Canonical Ltd.
+# Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Test cases of Runner class."""
@@ -12,16 +12,21 @@ import jinja2
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
+from charm_state import GithubOrg, GithubRepo, SSHDebugConnection, VirtualMachineResources
 from errors import CreateSharedFilesystemError, RunnerCreateError, RunnerRemoveError
-from runner import Runner, RunnerClients, RunnerConfig, RunnerStatus
-from runner_type import GitHubOrg, GitHubRepo, VirtualMachineResources
+from runner import CreateRunnerConfig, Runner, RunnerConfig, RunnerStatus
+from runner_manager_type import RunnerManagerClients
+from runner_type import ProxySetting
 from shared_fs import SharedFilesystem
+from tests.unit.factories import SSHDebugInfoFactory
 from tests.unit.mock import (
     MockLxdClient,
     MockRepoPolicyComplianceClient,
     mock_lxd_error_func,
     mock_runner_error_func,
 )
+
+TEST_PROXY_SERVER_URL = "http://proxy.server:1234"
 
 
 @pytest.fixture(scope="module", name="vm_resources")
@@ -88,19 +93,39 @@ def jinja2_environment_fixture() -> MagicMock:
     return jinja2_mock
 
 
+@pytest.fixture(scope="function", name="ssh_debug_connections")
+def ssh_debug_connections_fixture() -> list[SSHDebugConnection]:
+    """A list of randomly generated ssh_debug_connections."""
+    return SSHDebugInfoFactory.create_batch(size=100)
+
+
 @pytest.fixture(
     scope="function",
     name="runner",
     params=[
-        (GitHubOrg("test_org", "test_group"), {}),
         (
-            GitHubRepo("test_owner", "test_repo"),
-            {"no_proxy": "test_no_proxy", "http": "test_http", "https": "test_https"},
+            GithubOrg("test_org", "test_group"),
+            ProxySetting(no_proxy=None, http=None, https=None, aproxy_address=None),
+        ),
+        (
+            GithubRepo("test_owner", "test_repo"),
+            ProxySetting(
+                no_proxy="test_no_proxy",
+                http=TEST_PROXY_SERVER_URL,
+                https=TEST_PROXY_SERVER_URL,
+                aproxy_address=None,
+            ),
         ),
     ],
 )
-def runner_fixture(request, lxd: MockLxdClient, jinja: MagicMock, tmp_path: Path):
-    client = RunnerClients(
+def runner_fixture(
+    request,
+    lxd: MockLxdClient,
+    jinja: MagicMock,
+    tmp_path: Path,
+    ssh_debug_connections: list[SSHDebugConnection],
+):
+    client = RunnerManagerClients(
         MagicMock(),
         jinja,
         lxd,
@@ -114,8 +139,10 @@ def runner_fixture(request, lxd: MockLxdClient, jinja: MagicMock, tmp_path: Path
         path=request.param[0],
         proxies=request.param[1],
         lxd_storage_path=pool_path,
+        labels=("test", "label"),
         dockerhub_mirror=None,
         issue_metrics=False,
+        ssh_debug_connections=ssh_debug_connections,
     )
     status = RunnerStatus()
     return Runner(
@@ -137,8 +164,14 @@ def test_create(
     act: Create a runner.
     assert: An lxd instance for the runner is created.
     """
-
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
 
     instances = lxd.instances.all()
     assert len(instances) == 1
@@ -161,6 +194,7 @@ def test_create_lxd_fail(
     token: str,
     binary_path: Path,
     lxd: MockLxdClient,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """
     arrange: Setup the create runner to fail with lxd error.
@@ -168,10 +202,17 @@ def test_create_lxd_fail(
     assert: Correct exception should be thrown. Any created instance should be
         cleanup.
     """
-    lxd.profiles.exists = mock_lxd_error_func
+    monkeypatch.setattr(lxd.profiles, "exists", mock_lxd_error_func)
 
     with pytest.raises(RunnerCreateError):
-        runner.create("test_image", vm_resources, binary_path, token)
+        runner.create(
+            config=CreateRunnerConfig(
+                image="test_image",
+                resources=vm_resources,
+                binary_path=binary_path,
+                registration_token=token,
+            )
+        )
 
     assert len(lxd.instances.all()) == 0
 
@@ -192,7 +233,14 @@ def test_create_runner_fail(
     runner._clients.lxd.instances.create = mock_runner_error_func
 
     with pytest.raises(RunnerCreateError):
-        runner.create("test_image", vm_resources, binary_path, token)
+        runner.create(
+            config=CreateRunnerConfig(
+                image="test_image",
+                resources=vm_resources,
+                binary_path=binary_path,
+                registration_token=token,
+            )
+        )
 
 
 def test_create_with_metrics(
@@ -211,12 +259,18 @@ def test_create_with_metrics(
     assert: The command for adding a device has been executed and the templates are
         rendered to issue metrics.
     """
-
     runner.config.issue_metrics = True
     shared_fs.create.return_value = SharedFilesystem(
         path=Path("/home/ubuntu/shared_fs"), runner_name="test_runner"
     )
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
 
     exc_cmd_mock.assert_called_once_with(
         [
@@ -248,15 +302,22 @@ def test_create_with_metrics_and_shared_fs_error(
     shared_fs: MagicMock,
 ):
     """
-    arrange: Config the runner to issue metrics and mock the shared filesystem module
-     to throw an expected error.
+    arrange: Config the runner to issue metrics and mock the shared filesystem module\
+        to throw an expected error.
     act: Create a runner.
     assert: The runner is created despite the error on the shared filesystem.
     """
     runner.config.issue_metrics = True
     shared_fs.create.side_effect = CreateSharedFilesystemError("")
 
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
 
     instances = lxd.instances.all()
     assert len(instances) == 1
@@ -274,8 +335,14 @@ def test_remove(
     act: Remove the runner.
     assert: The lxd instance for the runner is removed.
     """
-
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
     runner.remove("test_token")
     assert len(lxd.instances.all()) == 0
 
@@ -294,7 +361,14 @@ def test_remove_failed_instance(
     """
     # Cases where the ephemeral instance encountered errors and the status was Stopped but not
     # removed was found before.
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
     runner.instance.status = "Stopped"
     runner.remove("test_token")
     assert len(lxd.instances.all()) == 0
@@ -310,7 +384,6 @@ def test_remove_none(
     act: Remove the runner.
     assert: The lxd instance for the runner is removed.
     """
-
     runner.remove(token)
     assert len(lxd.instances.all()) == 0
 
@@ -327,7 +400,14 @@ def test_remove_with_stop_error(
     act: Remove the runner.
     assert: RunnerRemoveError is raised.
     """
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
     runner.instance.stop = mock_lxd_error_func
 
     with pytest.raises(RunnerRemoveError):
@@ -346,9 +426,46 @@ def test_remove_with_delete_error(
     act: Remove the runner.
     assert: RunnerRemoveError is raised.
     """
-    runner.create("test_image", vm_resources, binary_path, token)
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
     runner.instance.status = "Stopped"
     runner.instance.delete = mock_lxd_error_func
 
     with pytest.raises(RunnerRemoveError):
         runner.remove("test_token")
+
+
+def test_random_ssh_connection_choice(
+    runner: Runner,
+    vm_resources: VirtualMachineResources,
+    token: str,
+    binary_path: Path,
+):
+    """
+    arrange: given a mock runner with random batch of ssh debug infos.
+    act: when runner.configure_runner is called.
+    assert: selected ssh_debug_info is random.
+    """
+    runner.create(
+        config=CreateRunnerConfig(
+            image="test_image",
+            resources=vm_resources,
+            binary_path=binary_path,
+            registration_token=token,
+        )
+    )
+    runner._configure_runner()
+    first_call_args = runner._clients.jinja.get_template("env.j2").render.call_args.kwargs
+    runner._configure_runner()
+    second_call_args = runner._clients.jinja.get_template("env.j2").render.call_args.kwargs
+
+    assert first_call_args["ssh_debug_info"] != second_call_args["ssh_debug_info"], (
+        "Same ssh debug info found, this may have occurred with a very low probability. "
+        "Just try again."
+    )

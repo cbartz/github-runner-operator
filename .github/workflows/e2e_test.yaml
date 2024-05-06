@@ -34,7 +34,7 @@ jobs:
           EOF
 
       - name: Cache github-runner Charm
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         id: cache-charm
         with:
           path: github-runner_ubuntu-22.04-amd64.charm
@@ -53,7 +53,7 @@ jobs:
         run: charmcraft pack || ( cat ~/.local/state/charmcraft/log/* && exit 1 )
 
       - name: Upload github-runner Charm
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dangerous-test-only-github-runner_ubuntu-22.04-amd64.charm
           path: github-runner_ubuntu-22.04-amd64.charm
@@ -84,6 +84,8 @@ jobs:
             abbreviation: push
           - name: schedule
             abbreviation: sd
+          - name: issues
+            abbreviation: is
     steps:
       - name: Setup Lxd Juju Controller
         uses: charmed-kubernetes/actions-operator@main
@@ -94,6 +96,17 @@ jobs:
       - name: Install GitHub Cli
         run: which gh || sudo apt install gh -y
 
+      - name: Check rate limit
+        env:
+          GH_TOKEN: ${{ (matrix.event.name == 'issues' || matrix.event.name == 'schedule') && secrets.E2E_TESTING_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # Check rate limit, this check does not count against the primary rate limit:
+          # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28#checking-the-status-of-your-rate-limit
+          gh api \
+              --method GET \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" --jq ".resources.core" \
+              /rate_limit
       - name: Create Testing Juju Model
         run: juju add-model testing
 
@@ -107,7 +120,7 @@ jobs:
         run: juju model-config logging-config="<root>=INFO;unit=DEBUG"
 
       - name: Download github-runner Charm
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dangerous-test-only-github-runner_ubuntu-22.04-amd64.charm
 
@@ -116,11 +129,11 @@ jobs:
 
       - name: Generate Runner Name
         id: runner-name
-        run: echo name=${{ matrix.event.abbreviation }}-${{ needs.run-id.outputs.run-id }} >> $GITHUB_OUTPUT
+        run: echo name=${{ matrix.event.abbreviation }}-${{ needs.run-id.outputs.run-id }}${{ github.run_attempt }} >> $GITHUB_OUTPUT
 
       - name: Copy github-runner Charm
         run: |
-          cp github-runner_ubuntu-22.04-amd64.charm /home/$USER/github-runner_ubuntu-22.04-amd64.charm
+          cp  github-runner_ubuntu-22.04-amd64.charm /home/$USER/github-runner_ubuntu-22.04-amd64.charm
 
       - name: Deploy github-runner Charm (Pull Request, Workflow Dispatch and Push)
         if: matrix.event.name == 'workflow_dispatch' || matrix.event.name == 'push' || matrix.event.name == 'pull_request'
@@ -134,45 +147,33 @@ jobs:
             --config denylist=10.0.0.0/8 \
             --config test-mode=insecure
 
-      - name: Checkout branch (Schedule)
-        if: matrix.event.name == 'schedule'
+      - name: Checkout branch (Issues, Schedule)
+        if: matrix.event.name == 'issues' || matrix.event.name == 'schedule'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
           token: ${{ secrets.E2E_TESTING_TOKEN }}
-      - name: Create temporary orphan branch (Schedule)
-        if: matrix.event.name == 'schedule'
+      - name: Create temporary orphan branch (Issues, Schedule)
+        if: matrix.event.name == 'issues' || matrix.event.name == 'schedule'
         run: |
-          # We dont need all content for schedule test, so create an orphan branch.
+          # We dont need all content for the test, so create an orphan branch.
           git checkout --orphan ${{ steps.runner-name.outputs.name }}
           git reset
-          
-          # Create schedule test workflow
-          SCHEDULE_WF_FILE=".github/workflows/schedule_test.yaml"
-          sed -i "s/workflow_dispatch:/schedule:\n  - cron: '*\/5 * * * *'/" $SCHEDULE_WF_FILE
-          git add $SCHEDULE_WF_FILE
+
+          WF_FILE=".github/workflows/schedule_issues_test.yaml"
+          # Replace workflow event in schedule_issues_test.yaml
+          if [[ ${{ matrix.event.name }} == 'schedule' ]]; then
+            sed -i "s/workflow_dispatch:/schedule:\n  - cron: '*\/5 * * * *'/" $WF_FILE
+          else
+            sed -i "s/workflow_dispatch:/issues:\n    types: [opened]/" $WF_FILE
+          fi
+          git add $WF_FILE
           git config user.name github-actions
           git config user.email github-actions@github.com
-          git commit -m"Add schedule workflow"
+          git commit -m"Add ${{matrix.event.name}} workflow"
           git push origin ${{ steps.runner-name.outputs.name }}
-      - name: Create signed commit (Schedule)
-        if: matrix.event.name == 'schedule'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # The last commit on the branch is required to be signed in order to pass the repo policy check.
-          # We create an unused file and commit it using the GH API in order to create a signed commit.
-          # We need to use the GITHUB_TOKEN because the E2E_TESTING_TOKEN is user-bound and would 
-          # create an an unsigned commit.
-          CONTENT=$(echo "Hello world" | base64) 
-          gh api \
-            --method PUT \
-            /repos/${{ github.repository }}/contents/helloworld.txt \
-            --field message="Add schedule workflow" \
-            --field content="$CONTENT"  \
-            --field branch="${{ steps.runner-name.outputs.name }}"
-      - name: Deploy github-runner Charm (Schedule)
-        if: matrix.event.name == 'schedule'
+      - name: Deploy github-runner Charm (Issues, Schedule)
+        if: matrix.event.name == 'issues' || matrix.event.name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.E2E_TESTING_TOKEN }}
         run: |
@@ -221,8 +222,8 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             /repos/${{ secrets.E2E_TESTING_REPO }}/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs)
-            CONCLUSION=$(echo $JOBS | jq -r '.jobs[] | select(.name == "End-to-End Test") | .conclusion')
-            STATUS=$(echo $JOBS | jq -r '.jobs[] | select(.name == "End-to-End Test") | .status')
+            CONCLUSION=$(echo $JOBS | jq -r '.jobs[] | select(.name == "End-to-End Test / End-to-End Test Run") | .conclusion')
+            STATUS=$(echo $JOBS | jq -r '.jobs[] | select(.name == "End-to-End Test / End-to-End Test Run") | .status')
             if [[ $STATUS != "queued" && $STATUS != "in_progress" ]]; then
               break
             fi
@@ -234,13 +235,13 @@ jobs:
             exit 1
           fi
 
-      - name: Watch github-runner (Workflow Dispatch and Push)
+      - name: Trigger workflow (Workflow Dispatch and Push)
         if: matrix.event.name == 'workflow_dispatch' || matrix.event.name == 'push'
         env:
-          GH_TOKEN: ${{ secrets.E2E_TESTING_TOKEN }}
+          # push requires E2E_TESTING_TOKEN, because if GITHUB_TOKEN is used, no workflow is triggered for a push:
+          # https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
+          GH_TOKEN: ${{ matrix.event.name == 'workflow_dispatch' && secrets.GITHUB_TOKEN || secrets.E2E_TESTING_TOKEN }}
         run: |
-          juju debug-log --replay --tail &
-
           # Base any future branches on the current branch
           REF_SHA=$(gh api \
             -H "Accept: application/vnd.github+json" \
@@ -266,6 +267,13 @@ jobs:
               --ref ${{ steps.runner-name.outputs.name }} \
               -f runner=${{ steps.runner-name.outputs.name }}
           fi
+
+      - name: Watch github-runner (Workflow Dispatch and Push)
+        if: matrix.event.name == 'workflow_dispatch' || matrix.event.name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          juju debug-log --replay --tail &
 
           get-workflow-status() {
               # Search recent workflow runs for the one designated by the run-id ref
@@ -313,8 +321,8 @@ jobs:
             kill $(jobs -p)
           fi
 
-      - name: Watch github-runner (Schedule)
-        if: matrix.event.name == 'schedule'
+      - name: Trigger workflow and watch github-runner (Issues, Schedule)
+        if:  matrix.event.name == 'issues' || matrix.event.name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.E2E_TESTING_TOKEN }}
         run: |
@@ -322,23 +330,15 @@ jobs:
 
           TESTING_REPO=${{ secrets.E2E_TESTING_TOKEN_ORG }}/${{ steps.runner-name.outputs.name }}
 
-          # Create branch protection rule in order to be able to let schedule test pass repo policy check
-          gh api \
-            --method PUT \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/${TESTING_REPO}/branches/main/protection \
-            -F required_status_checks=null \
-            -F enforce_admins=null \
-            -F required_pull_request_reviews=null \
-            -F restrictions=null
-
-          # Create signed commit protected branch in order to be able to let schedule test pass repo policy check
-          gh api \
-              --method POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              /repos/${TESTING_REPO}/branches/main/protection/required_signatures
+          # For issues, we need to trigger the workflow by opening an issue
+            if ${{ matrix.event.name == 'issues' }}; then
+                gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                /repos/${TESTING_REPO}/issues \
+                -f title="Test issue ${{ steps.runner-name.outputs.name }}"
+            fi
 
           get-workflow-status() {
               # Search recent workflow runs for the one designated by the run-id ref
@@ -379,12 +379,13 @@ jobs:
           conclusion=$(echo $runs | jq -r '.[0].conclusion')
           wf_run_id=$(echo $runs | jq -r '.[0].id')
 
+          logs_filename=${{matrix.event.name}}-workflow-logs.zip
           # We retrieve the logs because the testing repo is deleted at the end of the test
           gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/${TESTING_REPO}/actions/runs/${wf_run_id}/logs > schedule-workflow-logs.zip \
-              || (echo "Failed to retrieve logs from schedule tests" && rm schedule-workflow-logs.zip)
+            /repos/${TESTING_REPO}/actions/runs/${wf_run_id}/logs > ${logs_filename} \
+              || (echo "Failed to retrieve logs from schedule tests" && rm ${logs_filename})
 
 
           if [[ $status != "completed" || $conclusion != "success" ]]; then
@@ -395,12 +396,12 @@ jobs:
             echo "Workflow completed with status: $status, conclusion: $conclusion, run-id: ${{ steps.runner-name.outputs.name }}"
             kill $(jobs -p)
           fi
-      - name: Upload schedule test logs (Schedule)
-        if: always() && matrix.event.name == 'schedule'
-        uses: actions/upload-artifact@v3
+      - name: Upload test logs (Issues, Schedule)
+        if: always() && (matrix.event.name == 'issues' || matrix.event.name == 'schedule')
+        uses: actions/upload-artifact@v4
         with:
-          name: schedule-workflow-logs.zip
-          path: schedule-workflow-logs.zip
+          name: ${{matrix.event.name}}-workflow-logs.zip
+          path: ${{matrix.event.name}}-workflow-logs.zip
           if-no-files-found: ignore
 
       - name: Show Firewall Rules
@@ -410,7 +411,7 @@ jobs:
       - name: Clean Up (Workflow Dispatch and Push)
         if: always() && (matrix.event.name == 'workflow_dispatch' || matrix.event.name == 'push')
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api \
           --method DELETE \
@@ -419,8 +420,8 @@ jobs:
           "/repos/${{ secrets.E2E_TESTING_REPO }}/git/refs/heads/${{ steps.runner-name.outputs.name }}"
           echo "Deleted ref ${{ steps.runner-name.outputs.name }}"
 
-      - name: Clean Up (Schedule)
-        if: always() && (matrix.event.name == 'schedule')
+      - name: Clean Up (Issues, Schedule)
+        if: always() && (matrix.event.name == 'issues' || matrix.event.name == 'schedule')
         env:
           GH_TOKEN: ${{ secrets.E2E_TESTING_TOKEN }}
         run: |
@@ -448,64 +449,17 @@ jobs:
   e2e-test:
     name: End-to-End Test
     needs: [build-charm, run-id]
-    runs-on: [self-hosted, linux, x64, "pr-${{ needs.run-id.outputs.run-id }}"]
+    uses: ./.github/workflows/e2e_test_run.yaml
+    with:
+      runner-tag: "pr-${{ needs.run-id.outputs.run-id }}${{ github.run_attempt}}"
+
+  required_status_checks:
+    name: Required E2E Test Status Checks
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-e2e-test-runner
+    if: always() && !cancelled()
+    timeout-minutes: 5
     steps:
-      # Snapd can have some issues in privileged LXD containers without setting 
-      # security.nesting=True and this.
-      - name: Fix snap issue in privileged LXD containers
-        run: ln -s /bin/true /usr/local/bin/udevadm
-      # Below is a series of simple tests to assess the functionality of the newly spawned runner.
-      - name: Echo hello world
-        run: echo "hello world"
-      - name: File permission for /usr/local/bin
-        run: ls -ld /usr/local/bin | grep drwxrwxrwx
-      - name: Test file permission for /usr/local/bin
-        run: touch /usr/local/bin/test_file
-      # "Install microk8s" step will test if the proxies settings are correct.
-      - name: Proxy set in /etc/environment
-        run: cat /etc/environment
-      # "Update apt in python docker container" step will test docker default proxy settings due to
-      # pulling the python image.
-      - name: Proxy set in docker daemon
-        run: |
-          [[ -z "${http_proxy}" && -z "${HTTP_PROXY}" ]] \
-            || sudo cat /etc/systemd/system/docker.service.d/http-proxy.conf | grep HTTP_PROXY
-      # "Update apt in python docker container" step will test docker client default proxy settings.
-      - name: Proxy set in docker client
-        run: |
-          [[ -z "${http_proxy}" && -z "${HTTP_PROXY}" ]] \
-            || cat /home/ubuntu/.docker/config.json | grep httpProxy
-      - name: Install microk8s
-        run: sudo snap install microk8s --classic
-      - name: Wait for microk8s
-        timeout-minutes: 10
-        run: microk8s status --wait-ready
-      - name: Deploy nginx for testing
-        run: microk8s kubectl create deployment nginx --image=nginx
-      - name: Wait for nginx to be ready
-        run: microk8s kubectl rollout status deployment/nginx --timeout=30m
-      - name: Update apt in python docker container
-        run: docker run python:3.10-slim apt-get update
-      - name: Docker version
-        run: docker version
-      - name: Check python alias for python3
-        run: python --version
-      - name: pip version
-        run: python3 -m pip --version
-      - name: npm version
-        run: npm --version
-      - name: shellcheck version
-        run: shellcheck --version
-      - name: jq version
-        run: jq --version
-      - name: yq version
-        run: yq --version
-      - name: install check-jsonschema
-        run: python3 -m pip install check-jsonschema
-      # `check-jsonschema` is installed using pip. The directory `~/.local/bin` needs to be added to PATH.
-      - name: test check-jsonschema
-        run: check-jsonschema --version
-      - name: Test Firewall
-        run: |
-          HOST_IP=$(ip route | grep default | cut -f 3 -d" ")
-          [ $((ping $HOST_IP -c 5 || :) | grep "Destination Port Unreachable" | wc -l) -eq 5 ]
+      - run: |
+          [ '${{ needs.deploy-e2e-test-runner.result }}' = 'success' ] || (echo deploy-e2e-test-runner failed && false)

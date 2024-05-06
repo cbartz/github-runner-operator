@@ -9,6 +9,29 @@ The `Runner` class stores the information on the runners and manages the lifecyc
 
 The `RunnerManager` class from `runner_manager.py` creates and manages a collection of `Runner` instances. 
 
+**Global Variables**
+---------------
+- **APROXY_ARM_REVISION**
+- **APROXY_AMD_REVISION**
+
+
+---
+
+## <kbd>class</kbd> `CreateRunnerConfig`
+The configuration values for creating a single runner instance. 
+
+
+
+**Attributes:**
+ 
+ - <b>`image`</b>:  Name of the image to launch the LXD instance with. 
+ - <b>`resources`</b>:  Resource setting for the LXD instance. 
+ - <b>`binary_path`</b>:  Path to the runner binary. 
+ - <b>`registration_token`</b>:  Token for registering the runner on GitHub. 
+ - <b>`arch`</b>:  Current machine architecture. 
+
+
+
 
 
 ---
@@ -20,21 +43,19 @@ Single instance of GitHub self-hosted runner.
 
 **Attributes:**
  
- - <b>`app_name`</b> (str):  Name of the charm. 
- - <b>`path`</b> (GitHubPath):  Path to GitHub repo or org. 
- - <b>`proxies`</b> (ProxySetting):  HTTP proxy setting for juju charm. 
- - <b>`name`</b> (str):  Name of the runner instance. 
- - <b>`exist`</b> (bool):  Whether the runner instance exists on LXD. 
- - <b>`online`</b> (bool):  Whether GitHub marks this runner as online. 
- - <b>`busy`</b> (bool):  Whether GitHub marks this runner as busy. 
+ - <b>`runner_application`</b>:  The runner application directory path 
+ - <b>`env_file`</b>:  The runner environment source .env file path. 
+ - <b>`config_script`</b>:  The runner configuration script file path. 
+ - <b>`runner_script`</b>:  The runner start script file path. 
+ - <b>`pre_job_script`</b>:  The runner pre_job script file path. This is referenced in the env_file in  the ACTIONS_RUNNER_HOOK_JOB_STARTED environment variable. 
 
-<a href="../src/runner.py#L87"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner.py#L118"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `__init__`
 
 ```python
 __init__(
-    clients: RunnerClients,
+    clients: RunnerManagerClients,
     runner_config: RunnerConfig,
     runner_status: RunnerStatus,
     instance: Optional[LxdInstance] = None
@@ -49,6 +70,7 @@ Construct the runner instance.
  
  - <b>`clients`</b>:  Clients to access various services. 
  - <b>`runner_config`</b>:  Configuration of the runner instance. 
+ - <b>`runner_status`</b>:  Status info of the given runner. 
  - <b>`instance`</b>:  LXD instance of the runner if already created. 
 
 
@@ -56,17 +78,12 @@ Construct the runner instance.
 
 ---
 
-<a href="../src/runner.py#L117"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner.py#L141"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `create`
 
 ```python
-create(
-    image: str,
-    resources: VirtualMachineResources,
-    binary_path: Path,
-    registration_token: str
-)
+create(config: CreateRunnerConfig) → None
 ```
 
 Create the runner instance on LXD and register it on GitHub. 
@@ -75,10 +92,7 @@ Create the runner instance on LXD and register it on GitHub.
 
 **Args:**
  
- - <b>`image`</b>:  Name of the image to launch the LXD instance with. 
- - <b>`resources`</b>:  Resource setting for the LXD instance. 
- - <b>`binary_path`</b>:  Path to the runner binary. 
- - <b>`registration_token`</b>:  Token for registering the runner on GitHub. 
+ - <b>`config`</b>:  The instance config to create the LXD VMs and configure GitHub runner with. 
 
 
 
@@ -88,12 +102,12 @@ Create the runner instance on LXD and register it on GitHub.
 
 ---
 
-<a href="../src/runner.py#L160"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner.py#L234"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `remove`
 
 ```python
-remove(remove_token: str) → None
+remove(remove_token: Optional[str]) → None
 ```
 
 Remove this runner instance from LXD and GitHub. 
@@ -114,7 +128,15 @@ Remove this runner instance from LXD and GitHub.
 ---
 
 ## <kbd>class</kbd> `Snap`
-Snap(name, channel) 
+This class represents a snap installation. 
+
+
+
+**Attributes:**
+ 
+ - <b>`name`</b>:  The snap application name. 
+ - <b>`channel`</b>:  The channel to install the snap from. 
+ - <b>`revision`</b>:  The revision number of the snap installation. 
 
 
 
@@ -127,7 +149,7 @@ The executable to be installed through wget.
 
 
 
-**Args:**
+**Attributes:**
  
  - <b>`url`</b>:  The URL of the executable binary. 
  - <b>`cmd`</b>:  Executable command name. E.g. yq_linux_amd64 -> yq 

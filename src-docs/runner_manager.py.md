@@ -13,21 +13,17 @@ Runner Manager manages the runners on LXD and GitHub.
 
 ---
 
-## <kbd>class</kbd> `RunnerInfo`
-Information from GitHub of a runner. 
-
-Used as a returned type to method querying runner information. 
-
-
-
-
-
----
-
 ## <kbd>class</kbd> `RunnerManager`
 Manage a group of runners according to configuration. 
 
-<a href="../src/runner_manager.py#L99"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+
+
+**Attributes:**
+ 
+ - <b>`runner_bin_path`</b>:  The github runner app scripts path. 
+ - <b>`cron_path`</b>:  The path to runner build image cron job. 
+
+<a href="../src/runner_manager.py#L69"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `__init__`
 
@@ -35,8 +31,7 @@ Manage a group of runners according to configuration.
 __init__(
     app_name: str,
     unit: int,
-    runner_manager_config: RunnerManagerConfig,
-    proxies: Optional[ProxySetting] = None
+    runner_manager_config: RunnerManagerConfig
 ) → None
 ```
 
@@ -49,14 +44,33 @@ Construct RunnerManager object for creating and managing runners.
  - <b>`app_name`</b>:  An name for the set of runners. 
  - <b>`unit`</b>:  Unit number of the set of runners. 
  - <b>`runner_manager_config`</b>:  Configuration for the runner manager. 
- - <b>`proxies`</b>:  HTTP proxy settings. 
 
 
 
 
 ---
 
-<a href="../src/runner_manager.py#L160"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/utilities.py#L797"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+
+### <kbd>function</kbd> `build_runner_image`
+
+```python
+build_runner_image() → None
+```
+
+Build the LXD image for hosting runner. 
+
+Build container image in test mode, else virtual machine image. 
+
+
+
+**Raises:**
+ 
+ - <b>`SubprocessError`</b>:  Unable to build the LXD image. 
+
+---
+
+<a href="../src/runner_manager.py#L121"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `check_runner_bin`
 
@@ -73,12 +87,12 @@ Check if runner binary exists.
 
 ---
 
-<a href="../src/runner_manager.py#L530"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager.py#L608"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `flush`
 
 ```python
-flush(flush_busy: bool = True) → int
+flush(mode: FlushMode = <FlushMode.FLUSH_IDLE: 1>) → int
 ```
 
 Remove existing runners. 
@@ -87,7 +101,13 @@ Remove existing runners.
 
 **Args:**
  
- - <b>`flush_busy`</b>:  Whether to flush busy runners as well. 
+ - <b>`mode`</b>:  Strategy for flushing runners. 
+
+
+
+**Raises:**
+ 
+ - <b>`GithubClientError`</b>:  If there was an error getting remove-token to unregister runners                 from GitHub. 
 
 
 
@@ -96,7 +116,7 @@ Remove existing runners.
 
 ---
 
-<a href="../src/runner_manager.py#L273"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager.py#L222"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `get_github_info`
 
@@ -113,15 +133,12 @@ Get information on the runners from GitHub.
 
 ---
 
-<a href="../src/utilities.py#L168"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/utilities.py#L129"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `get_latest_runner_bin_url`
 
 ```python
-get_latest_runner_bin_url(
-    os_name: str = 'linux',
-    arch_name: str = 'x64'
-) → RunnerApplication
+get_latest_runner_bin_url(os_name: str = 'linux') → RunnerApplication
 ```
 
 Get the URL for the latest runner binary. 
@@ -133,7 +150,12 @@ The runner binary URL changes when a new version is available.
 **Args:**
  
  - <b>`os_name`</b>:  Name of operating system. 
- - <b>`arch_name`</b>:  Name of architecture. 
+
+
+
+**Raises:**
+ 
+ - <b>`RunnerBinaryError`</b>:  If an error occurred while fetching runner application info. 
 
 
 
@@ -142,7 +164,24 @@ The runner binary URL changes when a new version is available.
 
 ---
 
-<a href="../src/runner_manager.py#L461"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager.py#L789"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+
+### <kbd>function</kbd> `has_runner_image`
+
+```python
+has_runner_image() → bool
+```
+
+Check if the runner image exists. 
+
+
+
+**Returns:**
+  Whether the runner image exists. 
+
+---
+
+<a href="../src/runner_manager.py#L526"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `reconcile`
 
@@ -166,7 +205,19 @@ Bring runners in line with target.
 
 ---
 
-<a href="../src/utilities.py#L206"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager.py#L812"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+
+### <kbd>function</kbd> `schedule_build_runner_image`
+
+```python
+schedule_build_runner_image() → None
+```
+
+Install cron job for building runner image. 
+
+---
+
+<a href="../src/utilities.py#L152"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ### <kbd>function</kbd> `update_runner_bin`
 
@@ -185,24 +236,9 @@ Remove the existing runner binary to prevent it from being used. This is done to
  - <b>`binary`</b>:  Information on the runner binary to download. 
 
 
----
 
-## <kbd>class</kbd> `RunnerManagerConfig`
-Configuration of runner manager. 
-
-
-
-**Attributes:**
+**Raises:**
  
- - <b>`path`</b>:  GitHub repository path in the format '<owner>/<repo>', or the  GitHub organization name. 
- - <b>`token`</b>:  GitHub personal access token to register runner to the  repository or organization. 
- - <b>`image`</b>:  Name of the image for creating LXD instance. 
- - <b>`service_token`</b>:  Token for accessing local service. 
- - <b>`lxd_storage_path`</b>:  Path to be used as LXD storage. 
- - <b>`charm_state`</b>:  The state of the charm. 
- - <b>`dockerhub_mirror`</b>:  URL of dockerhub mirror to use. 
-
-
-
+ - <b>`RunnerBinaryError`</b>:  If there was an error updating runner binary info. 
 
 

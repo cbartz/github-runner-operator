@@ -1,4 +1,4 @@
-# Copyright 2023 Canonical Ltd.
+# Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Low-level LXD client interface.
@@ -11,7 +11,8 @@ from __future__ import annotations
 import io
 import logging
 import tempfile
-from typing import IO, Optional, Tuple, Union
+from pathlib import Path
+from typing import IO, Any, Optional, Tuple, Union
 
 import pylxd.models
 
@@ -24,6 +25,8 @@ from lxd_type import (
     LxdStoragePoolConfiguration,
 )
 from utilities import execute_command, secure_run_subprocess
+
+LXC_BINARY = "/snap/bin/lxc"
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ class LxdInstanceFileManager:
         """Create a directory in the LXD instance.
 
         Args:
-            dir: Name of the directory to create.
+            dir_name: Name of the directory to create.
         """
         self.instance.execute(["/usr/bin/mkdir", "-p", dir_name])
 
@@ -63,7 +66,7 @@ class LxdInstanceFileManager:
             LxdError: Unable to load the file into the LXD instance.
         """
         lxc_cmd = [
-            "/snap/bin/lxc",
+            LXC_BINARY,
             "file",
             "push",
             "--create-dirs",
@@ -102,22 +105,28 @@ class LxdInstanceFileManager:
             file.write(content)
             file.flush()
 
-            self.push_file(file.name, filepath, mode)
+            try:
+                self.push_file(file.name, filepath, mode)
+            # 2024/04/02 - We should define a new error, wrap it and re-raise it.
+            except LxdError:  # pylint: disable=try-except-raise
+                raise
 
-    def pull_file(self, source: str, destination: str) -> None:
+    def pull_file(self, source: str, destination: str, is_dir: bool = False) -> None:
         """Pull a file from the LXD instance to the local machine.
 
         Args:
             source: Path of the file to pull in the LXD instance.
             destination: Path in local machine.
+            is_dir: Whether the source is a directory.
 
         Raises:
             LxdError: Unable to load the file from the LXD instance.
         """
         lxc_cmd = [
-            "/snap/bin/lxc",
+            LXC_BINARY,
             "file",
             "pull",
+            *(["-r"] if is_dir else []),
             f"{self.instance.name}/{source.lstrip('/')}",
             destination,
         ]
@@ -143,7 +152,11 @@ class LxdInstanceFileManager:
             The content of the file.
         """
         with tempfile.NamedTemporaryFile() as file:
-            self.pull_file(filepath, file.name)
+            try:
+                self.pull_file(filepath, file.name)
+            # 2024/04/02 - We should define a new error, wrap it and re-raise it.
+            except LxdError:  # pylint: disable=try-except-raise
+                raise
 
             return file.read().decode("utf-8")
 
@@ -166,7 +179,7 @@ class LxdInstance:
         """
         self._pylxd_instance = pylxd_instance
         self.name = self._pylxd_instance.name
-        self.files = LxdInstanceFileManager(self._pylxd_instance)
+        self.files = LxdInstanceFileManager(self)
 
     @property
     def status(self) -> str:
@@ -230,7 +243,7 @@ class LxdInstance:
             raise LxdError(f"Unable to delete the LXD instance {self.name}") from err
 
     def execute(
-        self, cmd: list[str], cwd: Optional[str] = None, hide_cmd: bool = False, **kwargs
+        self, cmd: list[str], cwd: Optional[str] = None, hide_cmd: bool = False, **kwargs: Any
     ) -> Tuple[int, IO, IO]:
         """Execute a command within the LXD instance.
 
@@ -251,7 +264,7 @@ class LxdInstance:
         Returns:
             Tuple containing the exit code, stdout, stderr.
         """
-        lxc_cmd = ["/snap/bin/lxc", "exec", self.name]
+        lxc_cmd = [LXC_BINARY, "exec", self.name]
         if cwd:
             lxc_cmd += ["--cwd", cwd]
 
@@ -346,7 +359,7 @@ class LxdProfileManager:
         Args:
             name: Name of the LXD profile to create.
             config: Configuration of the LXD profile.
-            devices Devices configuration of the LXD profile.
+            devices: Devices configuration of the LXD profile.
 
         Raises:
             LxdError: Unable to create the LXD profile.
@@ -365,6 +378,9 @@ class LxdProfileManager:
 
         Raises:
             LxdError: Unable to get the LXD profile with the name.
+
+        Returns:
+            LXDProfile with given name.
         """
         try:
             return self._pylxd_client.profiles.get(name)
@@ -393,12 +409,12 @@ class LxdProfile:
         self.devices = self._pylxd_profile.devices
         self.used_by = self._pylxd_profile.used_by
 
-    def save(self):
+    def save(self) -> None:
         """Save the current configuration of profile."""
         self._pylxd_profile.config = self.config
         self._pylxd_profile.save()
 
-    def delete(self):
+    def delete(self) -> None:
         """Delete the profile."""
         self._pylxd_profile.delete()
 
@@ -459,6 +475,9 @@ class LxdStoragePoolManager:
 
         Args:
             name: Name of the storage pool.
+
+        Raises:
+            LxdError: If the storage pool with given name was not found.
 
         Returns:
             The LXD storage pool.
@@ -521,24 +540,69 @@ class LxdStoragePool:
         self.config = self._pylxd_storage_pool.config
         self.managed = self._pylxd_storage_pool.managed
 
-    def save(self):
+    def save(self) -> None:
         """Save the current configuration of storage pool."""
         self._pylxd_storage_pool.config = self.config
         self._pylxd_storage_pool.save()
 
-    def delete(self):
+    def delete(self) -> None:
         """Delete the storage pool."""
         self._pylxd_storage_pool.delete()
+
+
+class LxdImageManager:  # pylint: disable=too-few-public-methods
+    """LXD image manager."""
+
+    def __init__(self, pylxd_client: pylxd.Client):
+        """Instantiate the LXD image manager.
+
+        Args:
+            pylxd_client: Instance of pylxd.Client.
+        """
+        self._pylxd_client = pylxd_client
+
+    def create(self, name: str, path: Path) -> None:
+        """Import a LXD image.
+
+        Args:
+            name: Alias for the image.
+            path: Path of the LXD image file.
+
+        Raises:
+            LxdError: Unable to import the file as LXD image.
+        """
+        result = secure_run_subprocess(["lxc", "image", "import", "--alias", name, str(path)])
+        if result.returncode != 0:
+            raise LxdError(result.stdout.decode("utf-8"))
+
+    def exists(self, alias: str) -> bool:
+        """Check if an image with the given name exists.
+
+        Args:
+            alias: Alias name of the image to check.
+
+        Returns:
+            Whether the image exists.
+        """
+        # There is no direct method to check if an image exists by alias in pylxd, we therefore
+        # use the pylxd client to get the image by alias and catch the NotFound exception.
+        try:
+            self._pylxd_client.images.get_by_alias(alias)
+        except pylxd.exceptions.NotFound:
+            return False
+
+        return True
 
 
 # Disable pylint as the public methods of this class are split into instances and profiles.
 class LxdClient:  # pylint: disable=too-few-public-methods
     """LXD client."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Instantiate the LXD client."""
         pylxd_client = pylxd.Client()
         self.instances = LxdInstanceManager(pylxd_client)
         self.profiles = LxdProfileManager(pylxd_client)
         self.networks = LxdNetworkManager(pylxd_client)
         self.storage_pools = LxdStoragePoolManager(pylxd_client)
+        self.images = LxdImageManager(pylxd_client)

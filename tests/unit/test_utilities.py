@@ -1,4 +1,4 @@
-# Copyright 2023 Canonical Ltd.
+# Copyright 2024 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Test cases of utilities."""
@@ -19,7 +19,16 @@ def test_execute_command_with_error(monkeypatch):
     assert: Throw related to subprocess thrown.
     """
 
-    def raise_called_process_error(*args, **kargs):
+    def raise_called_process_error(*args, **kwargs):
+        """Raise CalledProcessError exception.
+
+        Args:
+            args: Any positional arguments.
+            kwargs: Any keyword arguments.
+
+        Raises:
+            CalledProcessError: when called.
+        """
         raise CalledProcessError(returncode=1, cmd="mock cmd", stderr="mock stderr")
 
     mock_run = MagicMock()

@@ -36,7 +36,7 @@ from charm_state import (
     TOKEN_CONFIG_NAME,
     VIRTUAL_MACHINES_CONFIG_NAME,
 )
-from runner_manager import RunnerManager
+from runner_manager import LXDRunnerManager
 from tests.status_name import ACTIVE
 
 DISPATCH_TEST_WORKFLOW_FILENAME = "workflow_dispatch_test.yaml"
@@ -93,7 +93,7 @@ async def check_runner_binary_exists(unit: Unit) -> bool:
     Returns:
         Whether the runner binary file exists in the charm.
     """
-    return_code, _, _ = await run_in_unit(unit, f"test -f {RunnerManager.runner_bin_path}")
+    return_code, _, _ = await run_in_unit(unit, f"test -f {LXDRunnerManager.runner_bin_path}")
     return return_code == 0
 
 
@@ -141,10 +141,10 @@ async def remove_runner_bin(unit: Unit) -> None:
     Args:
         unit: Unit instance to check for the LXD profile.
     """
-    await run_in_unit(unit, f"rm {RunnerManager.runner_bin_path}")
+    await run_in_unit(unit, f"rm {LXDRunnerManager.runner_bin_path}")
 
     # No file should exists under with the filename.
-    return_code, _, _ = await run_in_unit(unit, f"test -f {RunnerManager.runner_bin_path}")
+    return_code, _, _ = await run_in_unit(unit, f"test -f {LXDRunnerManager.runner_bin_path}")
     assert return_code != 0
 
 
@@ -375,13 +375,14 @@ def _is_workflow_run_complete(run: WorkflowRun) -> bool:
 
 
 async def dispatch_workflow(
-    app: Application,
+    app: Application | None,
     branch: Branch,
     github_repository: Repository,
     conclusion: str,
     workflow_id_or_name: str,
     dispatch_input: dict | None = None,
-):
+    wait: bool = True,
+) -> WorkflowRun:
     """Dispatch a workflow on a branch for the runner to run.
 
     The function assumes that there is only one runner running in the unit.
@@ -391,21 +392,25 @@ async def dispatch_workflow(
         branch: The branch to dispatch the workflow on.
         github_repository: The github repository to dispatch the workflow on.
         conclusion: The expected workflow run conclusion.
+            This argument is ignored if wait is False.
         workflow_id_or_name: The workflow filename in .github/workflows in main branch to run or
             its id.
         dispatch_input: Workflow input values.
+        wait: Whether to wait for runner to run workflow until completion.
 
     Returns:
-        A completed workflow.
+        The workflow run.
     """
+    if dispatch_input is None:
+        assert app is not None, "If dispatch input not given the app cannot be None."
+        dispatch_input = {"runner": app.name}
+
     start_time = datetime.now(timezone.utc)
 
     workflow = github_repository.get_workflow(id_or_file_name=workflow_id_or_name)
 
     # The `create_dispatch` returns True on success.
-    assert workflow.create_dispatch(
-        branch, dispatch_input or {"runner": app.name}
-    ), "Failed to create workflow"
+    assert workflow.create_dispatch(branch, dispatch_input), "Failed to create workflow"
 
     # There is a very small chance of selecting a run not created by the dispatch above.
     run: WorkflowRun | None = await wait_for(
@@ -413,14 +418,30 @@ async def dispatch_workflow(
         timeout=10 * 60,
     )
     assert run, f"Run not found for workflow: {workflow.name} ({workflow.id})"
-    await wait_for(partial(_is_workflow_run_complete, run=run), timeout=60 * 30, check_interval=60)
 
+    if not wait:
+        return run
+    await wait_for_completion(run=run, conclusion=conclusion)
+
+    return run
+
+
+async def wait_for_completion(run: WorkflowRun, conclusion: str) -> None:
+    """Wait for the workflow run to complete.
+
+    Args:
+        run: The workflow run to wait for.
+        conclusion: The expected conclusion of the run.
+    """
+    await wait_for(
+        partial(_is_workflow_run_complete, run=run),
+        timeout=60 * 30,
+        check_interval=60,
+    )
     # The run object is updated by _is_workflow_run_complete function above.
     assert (
         run.conclusion == conclusion
     ), f"Unexpected run conclusion, expected: {conclusion}, got: {run.conclusion}"
-
-    return workflow
 
 
 P = ParamSpec("P")

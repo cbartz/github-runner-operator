@@ -17,8 +17,14 @@ import jinja2
 import requests
 import requests.adapters
 import urllib3
+from github_runner_manager.metrics import events as metric_events
+from github_runner_manager.metrics import github as github_metrics
+from github_runner_manager.metrics import runner as runner_metrics
+from github_runner_manager.metrics import runner_logs
+from github_runner_manager.metrics.runner import RUNNER_INSTALLED_TS_FILE_NAME
+from github_runner_manager.repo_policy_compliance_client import RepoPolicyComplianceClient
+from github_runner_manager.types_.github import RunnerApplication, SelfHostedRunner
 
-import reactive.runner_manager as reactive_runner_manager
 import shared_fs
 from charm_state import VirtualMachineResources
 from errors import (
@@ -32,18 +38,16 @@ from errors import (
     SubprocessError,
 )
 from github_client import GithubClient
-from github_type import RunnerApplication, SelfHostedRunner
 from lxd import LxdClient, LxdInstance
-from metrics import events as metric_events
-from metrics import github as github_metrics
-from metrics import runner as runner_metrics
-from metrics import runner_logs
-from metrics.runner import RUNNER_INSTALLED_TS_FILE_NAME
-from repo_policy_compliance_client import RepoPolicyComplianceClient
 from runner import LXD_PROFILE_YAML, CreateRunnerConfig, Runner, RunnerConfig, RunnerStatus
-from runner_manager_type import FlushMode, RunnerInfo, RunnerManagerClients, RunnerManagerConfig
+from runner_manager_type import (
+    LXDFlushMode,
+    LXDRunnerManagerConfig,
+    RunnerInfo,
+    RunnerManagerClients,
+)
 from runner_type import ProxySetting as RunnerProxySetting
-from runner_type import RunnerByHealth
+from runner_type import RunnerNameByHealth
 from utilities import execute_command, retry, set_env_var
 
 REMOVED_RUNNER_LOG_STR = "Removed runner: %s"
@@ -56,7 +60,7 @@ BUILD_IMAGE_SCRIPT_FILENAME = Path("scripts/build-lxd-image.sh")
 IssuedMetricEventsStats = dict[Type[metric_events.Event], int]
 
 
-class RunnerManager:
+class LXDRunnerManager:
     """Manage a group of runners according to configuration.
 
     Attributes:
@@ -71,7 +75,7 @@ class RunnerManager:
         self,
         app_name: str,
         unit: int,
-        runner_manager_config: RunnerManagerConfig,
+        runner_manager_config: LXDRunnerManagerConfig,
     ) -> None:
         """Construct RunnerManager object for creating and managing runners.
 
@@ -159,7 +163,7 @@ class RunnerManager:
 
         try:
             # Delete old version of runner binary.
-            RunnerManager.runner_bin_path.unlink(missing_ok=True)
+            LXDRunnerManager.runner_bin_path.unlink(missing_ok=True)
         except OSError as err:
             logger.exception("Unable to perform file operation on the runner binary path")
             raise RunnerBinaryError("File operation failed on the runner binary path") from err
@@ -182,7 +186,7 @@ class RunnerManager:
 
             sha256 = hashlib.sha256()
 
-            with RunnerManager.runner_bin_path.open(mode="wb") as file:
+            with LXDRunnerManager.runner_bin_path.open(mode="wb") as file:
                 # Process with chunk_size of 128 KiB.
                 for chunk in response.iter_content(chunk_size=128 * 1024, decode_unicode=False):
                     file.write(chunk)
@@ -222,7 +226,7 @@ class RunnerManager:
             for runner in remote_runners.values()
         )
 
-    def _get_runner_health_states(self) -> RunnerByHealth:
+    def _get_runner_health_states(self) -> RunnerNameByHealth:
         """Get all runners sorted into health groups.
 
         Returns:
@@ -247,7 +251,7 @@ class RunnerManager:
             else:
                 unhealthy.append(runner.name)
 
-        return RunnerByHealth(healthy, unhealthy)
+        return RunnerNameByHealth(healthy, unhealthy)
 
     def _create_runner(
         self, registration_token: str, resources: VirtualMachineResources, runner: Runner
@@ -267,7 +271,7 @@ class RunnerManager:
                 config=CreateRunnerConfig(
                     image=self.config.image,
                     resources=resources,
-                    binary_path=RunnerManager.runner_bin_path,
+                    binary_path=LXDRunnerManager.runner_bin_path,
                     registration_token=registration_token,
                     arch=self.config.charm_state.arch,
                 )
@@ -309,7 +313,7 @@ class RunnerManager:
                 config=CreateRunnerConfig(
                     image=self.config.image,
                     resources=resources,
-                    binary_path=RunnerManager.runner_bin_path,
+                    binary_path=LXDRunnerManager.runner_bin_path,
                     registration_token=registration_token,
                     arch=self.config.charm_state.arch,
                 )
@@ -325,7 +329,7 @@ class RunnerManager:
 
         total_stats: IssuedMetricEventsStats = {}
         for extracted_metrics in runner_metrics.extract(
-            metrics_storage_manager=shared_fs, ignore_runners=set(runner_states.healthy)
+            metrics_storage_manager=shared_fs, runners=set(runner_states.healthy)
         ):
             try:
                 job_metrics = github_metrics.job(
@@ -447,7 +451,7 @@ class RunnerManager:
         Raises:
             RunnerCreateError: If there was an error spawning new runner.
         """
-        if not RunnerManager.runner_bin_path.exists():
+        if not LXDRunnerManager.runner_bin_path.exists():
             raise RunnerCreateError("Unable to create runner due to missing runner binary.")
         logger.info("Getting registration token for GitHub runners.")
         registration_token = self._clients.github.get_runner_registration_token(self.config.path)
@@ -491,7 +495,7 @@ class RunnerManager:
             logger.info("There are no idle runners to remove.")
 
     def _cleanup_offline_runners(
-        self, runner_states: RunnerByHealth, all_runners: list[Runner]
+        self, runner_states: RunnerNameByHealth, all_runners: list[Runner]
     ) -> None:
         """Cleanup runners that are not running the github run.sh script.
 
@@ -529,9 +533,6 @@ class RunnerManager:
         Returns:
             Difference between intended runners and actual runners.
         """
-        if self.config.reactive_config:
-            logger.info("Reactive configuration detected, going into experimental reactive mode.")
-            return self._reconcile_reactive(quantity)
         start_ts = time.time()
 
         runners = self._get_runners()
@@ -576,21 +577,6 @@ class RunnerManager:
             )
         return delta
 
-    def _reconcile_reactive(self, quantity: int) -> int:
-        """Reconcile runners reactively.
-
-        Args:
-            quantity: Number of intended runners.
-
-        Returns:
-            The difference between intended runners and actual runners. In reactive mode
-            this number is never negative as additional processes should terminate after a timeout.
-        """
-        logger.info("Reactive mode is experimental and not yet fully implemented.")
-        return reactive_runner_manager.reconcile(
-            quantity=quantity, mq_uri=self.config.reactive_config.mq_uri, queue_name=self.app_name
-        )
-
     def _runners_in_pre_job(self) -> bool:
         """Check there exist runners in the pre-job script stage.
 
@@ -619,7 +605,7 @@ class RunnerManager:
                 return False
         return True
 
-    def flush(self, mode: FlushMode = FlushMode.FLUSH_IDLE) -> int:
+    def flush(self, mode: LXDFlushMode = LXDFlushMode.FLUSH_IDLE) -> int:
         """Remove existing runners.
 
         Args:
@@ -636,7 +622,7 @@ class RunnerManager:
             remove_token = self._clients.github.get_runner_remove_token(self.config.path)
         except GithubClientError:
             logger.exception("Failed to get remove-token to unregister runners from GitHub.")
-            if mode != FlushMode.FORCE_FLUSH_WAIT_REPO_CHECK:
+            if mode != LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK:
                 raise
             logger.info("Proceeding with flush without remove-token.")
             remove_token = None
@@ -656,9 +642,9 @@ class RunnerManager:
             logger.info(REMOVED_RUNNER_LOG_STR, runner.config.name)
 
         if mode in (
-            FlushMode.FLUSH_IDLE_WAIT_REPO_CHECK,
-            FlushMode.FLUSH_BUSY_WAIT_REPO_CHECK,
-            FlushMode.FORCE_FLUSH_WAIT_REPO_CHECK,
+            LXDFlushMode.FLUSH_IDLE_WAIT_REPO_CHECK,
+            LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK,
+            LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK,
         ):
             for _ in range(5):
                 if not self._runners_in_pre_job():
@@ -672,11 +658,11 @@ class RunnerManager:
                     )
                 )
 
-        if mode in {
-            FlushMode.FLUSH_BUSY_WAIT_REPO_CHECK,
-            FlushMode.FLUSH_BUSY,
-            FlushMode.FORCE_FLUSH_WAIT_REPO_CHECK,
-        }:
+        if mode in (
+            LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK,
+            LXDFlushMode.FLUSH_BUSY,
+            LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK,
+        ):
             busy_runners = [runner for runner in self._get_runners() if runner.status.exist]
 
             logger.info("Removing existing %i busy local runners", len(runners))

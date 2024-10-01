@@ -9,10 +9,12 @@ Types used by RunnerManager class.
 
 ---
 
-<a href="../src/runner_manager_type.py#L20"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager_type.py#L19"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
-## <kbd>class</kbd> `FlushMode`
+## <kbd>class</kbd> `LXDFlushMode`
 Strategy for flushing runners. 
+
+During pre-job (repo-check), the runners are marked as idle and if the pre-job fails, the runner falls back to being idle again. Hence wait_repo_check is required. 
 
 
 
@@ -30,7 +32,7 @@ Strategy for flushing runners.
 
 ---
 
-<a href="../src/runner_manager_type.py#L42"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager_type.py#L44"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `RunnerManagerClients`
 Clients for accessing various services. 
@@ -67,9 +69,9 @@ __init__(
 
 ---
 
-<a href="../src/runner_manager_type.py#L59"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager_type.py#L61"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
-## <kbd>class</kbd> `RunnerManagerConfig`
+## <kbd>class</kbd> `LXDRunnerManagerConfig`
 Configuration of runner manager. 
 
 
@@ -95,7 +97,7 @@ __init__(
     charm_state: CharmState,
     image: str,
     lxd_storage_path: Path,
-    path: GithubOrg | GithubRepo,
+    path: GitHubOrg | GitHubRepo,
     service_token: str,
     token: str,
     dockerhub_mirror: str | None = None,
@@ -119,54 +121,7 @@ Whether metrics for the runners should be collected.
 
 ---
 
-<a href="../src/runner_manager_type.py#L94"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
-
-## <kbd>class</kbd> `OpenstackRunnerManagerConfig`
-Configuration of runner manager. 
-
-
-
-**Attributes:**
- 
- - <b>`charm_state`</b>:  The state of the charm. 
- - <b>`path`</b>:  GitHub repository path in the format '<owner>/<repo>', or the  GitHub organization name. 
- - <b>`labels`</b>:  Additional labels for the runners. 
- - <b>`token`</b>:  GitHub personal access token to register runner to the  repository or organization. 
- - <b>`flavor`</b>:  OpenStack flavor for defining the runner resources. 
- - <b>`image`</b>:  Openstack image id to boot the runner with. 
- - <b>`network`</b>:  OpenStack network for runner network access. 
- - <b>`dockerhub_mirror`</b>:  URL of dockerhub mirror to use. 
- - <b>`reactive_config`</b>:  The configuration to spawn runners reactively. 
-
-<a href="../<string>"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
-
-### <kbd>method</kbd> `__init__`
-
-```python
-__init__(
-    charm_state: CharmState,
-    path: GithubOrg | GithubRepo,
-    labels: Iterable[str],
-    token: str,
-    flavor: str,
-    image: str,
-    network: str,
-    dockerhub_mirror: str | None,
-    reactive_config: ReactiveConfig | None = None
-) → None
-```
-
-
-
-
-
-
-
-
-
----
-
-<a href="../src/runner_manager_type.py#L123"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
+<a href="../src/runner_manager_type.py#L95"><img align="right" style="float:right;" src="https://img.shields.io/badge/-source-cccccc?style=flat-square"></a>
 
 ## <kbd>class</kbd> `RunnerInfo`
 Information from GitHub of a runner. 

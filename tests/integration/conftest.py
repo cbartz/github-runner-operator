@@ -85,7 +85,7 @@ def existing_app(pytestconfig: pytest.Config) -> Optional[str]:
 def app_name(existing_app: Optional[str]) -> str:
     """Randomized application name."""
     # Randomized app name to avoid collision when runner is connecting to GitHub.
-    return existing_app or f"integration-id{secrets.token_hex(2)}"
+    return existing_app or f"test-{secrets.token_hex(4)}"
 
 
 @pytest.fixture(scope="module", name="openstack_clouds_yaml")
@@ -194,13 +194,13 @@ def loop_device(pytestconfig: pytest.Config) -> Optional[str]:
 @pytest.fixture(scope="module", name="private_endpoint_config")
 def private_endpoint_config_fixture(pytestconfig: pytest.Config) -> PrivateEndpointConfigs | None:
     """The private endpoint configuration values."""
-    auth_url = pytestconfig.getoption("--openstack-auth-url")
-    password = pytestconfig.getoption("--openstack-password")
-    project_domain_name = pytestconfig.getoption("--openstack-project-domain-name")
-    project_name = pytestconfig.getoption("--openstack-project-name")
-    user_domain_name = pytestconfig.getoption("--openstack-user-domain-name")
-    user_name = pytestconfig.getoption("--openstack-username")
-    region_name = pytestconfig.getoption("--openstack-region-name")
+    auth_url = pytestconfig.getoption("--openstack-auth-url-amd64")
+    password = pytestconfig.getoption("--openstack-password-amd64")
+    project_domain_name = pytestconfig.getoption("--openstack-project-domain-name-amd64")
+    project_name = pytestconfig.getoption("--openstack-project-name-amd64")
+    user_domain_name = pytestconfig.getoption("--openstack-user-domain-name-amd64")
+    user_name = pytestconfig.getoption("--openstack-username-amd64")
+    region_name = pytestconfig.getoption("--openstack-region-name-amd64")
     if any(
         not val
         for val in (
@@ -265,17 +265,33 @@ def clouds_yaml_contents_fixture(
 @pytest.fixture(scope="module", name="network_name")
 def network_name_fixture(pytestconfig: pytest.Config) -> str:
     """Network to use to spawn test instances under."""
-    network_name = pytestconfig.getoption("--openstack-network-name")
-    assert network_name, "Please specify the --openstack-network-name command line option"
+    network_name = pytestconfig.getoption("--openstack-network-name-amd64")
+    assert network_name, "Please specify the --openstack-network-name-amd64 command line option"
     return network_name
 
 
 @pytest.fixture(scope="module", name="flavor_name")
 def flavor_name_fixture(pytestconfig: pytest.Config) -> str:
     """Flavor to create testing instances with."""
-    flavor_name = pytestconfig.getoption("--openstack-flavor-name")
+    flavor_name = pytestconfig.getoption("--openstack-flavor-name-amd64")
     assert flavor_name, "Please specify the --openstack-flavor-name command line option"
     return flavor_name
+
+
+@pytest.fixture(scope="module", name="openstack_test_image")
+def openstack_test_image_fixture(pytestconfig: pytest.Config) -> str:
+    """Image for testing openstack interfaces."""
+    test_image = pytestconfig.getoption("--openstack-test-image")
+    assert test_image, "Please specify the --openstack-test-image command line option"
+    return test_image
+
+
+@pytest.fixture(scope="module", name="openstack_test_flavor")
+def openstack_test_flavor_fixture(pytestconfig: pytest.Config) -> str:
+    """Flavor for testing openstack interfaces."""
+    test_flavor = pytestconfig.getoption("--openstack-test-flavor")
+    assert test_flavor, "Please specify the --openstack-test-flavor command line option"
+    return test_flavor
 
 
 @pytest.fixture(scope="module", name="openstack_connection")
@@ -745,18 +761,18 @@ async def mongodb_fixture(model: Model, existing_app: str | None) -> Application
 @pytest_asyncio.fixture(scope="module", name="app_for_reactive")
 async def app_for_reactive_fixture(
     model: Model,
-    basic_app: Application,
+    app_openstack_runner: Application,
     mongodb: Application,
     existing_app: Optional[str],
 ) -> Application:
     """Application for testing reactive."""
     if not existing_app:
-        await model.relate(f"{basic_app.name}:mongodb", f"{mongodb.name}:database")
+        await model.relate(f"{app_openstack_runner.name}:mongodb", f"{mongodb.name}:database")
 
-    await basic_app.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "1"})
-    await model.wait_for_idle(apps=[basic_app.name, mongodb.name], status=ACTIVE)
+    await app_openstack_runner.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "1"})
+    await model.wait_for_idle(apps=[app_openstack_runner.name, mongodb.name], status=ACTIVE)
 
-    return basic_app
+    return app_openstack_runner
 
 
 @pytest_asyncio.fixture(scope="module", name="basic_app")

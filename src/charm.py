@@ -7,29 +7,10 @@
 # pylint: disable=too-many-lines
 
 """Charm for creating and managing GitHub self-hosted runner instances."""
-from github_runner_manager.manager.cloud_runner_manager import (
-    GitHubRunnerConfig,
-    SupportServiceConfig,
-)
-from github_runner_manager.manager.runner_manager import (
-    FlushMode,
-    RunnerManager,
-    RunnerManagerConfig,
-)
-from github_runner_manager.manager.runner_scaler import RunnerScaler
-from github_runner_manager.openstack_cloud.openstack_runner_manager import (
-    OpenStackCloudConfig,
-    OpenStackRunnerManager,
-    OpenStackRunnerManagerConfig,
-    OpenStackServerConfig,
-)
-from github_runner_manager.reactive.types_ import QueueConfig as ReactiveQueueConfig
-from github_runner_manager.reactive.types_ import RunnerConfig as ReactiveRunnerConfig
-from github_runner_manager.types_.github import GitHubPath, GitHubRunnerStatus, parse_github_path
-
 from utilities import bytes_with_unit_to_kib, execute_command, remove_residual_venv_dirs, retry
 
 # This is a workaround for https://bugs.launchpad.net/juju/+bug/2058335
+# It is important that this is run before importation of any other modules.
 # pylint: disable=wrong-import-position,wrong-import-order
 # TODO: 2024-07-17 remove this once the issue has been fixed
 remove_residual_venv_dirs()
@@ -48,6 +29,27 @@ import jinja2
 import ops
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
+from github_runner_manager.errors import ReconcileError
+from github_runner_manager.manager.cloud_runner_manager import (
+    GitHubRunnerConfig,
+    SupportServiceConfig,
+)
+from github_runner_manager.manager.runner_manager import (
+    FlushMode,
+    RunnerManager,
+    RunnerManagerConfig,
+)
+from github_runner_manager.manager.runner_scaler import RunnerScaler
+from github_runner_manager.openstack_cloud.openstack_runner_manager import (
+    OpenStackCredentials,
+    OpenStackRunnerManager,
+    OpenStackRunnerManagerConfig,
+    OpenStackServerConfig,
+)
+from github_runner_manager.reactive.types_ import QueueConfig as ReactiveQueueConfig
+from github_runner_manager.reactive.types_ import RunnerConfig as ReactiveRunnerConfig
+from github_runner_manager.types_ import SystemUserConfig
+from github_runner_manager.types_.github import GitHubPath, GitHubRunnerStatus, parse_github_path
 from ops.charm import (
     ActionEvent,
     CharmBase,
@@ -60,7 +62,6 @@ from ops.charm import (
     UpgradeCharmEvent,
 )
 from ops.framework import StoredState
-from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, WaitingStatus
 
 import logrotate
@@ -108,6 +109,17 @@ REACTIVE_MQ_DB_NAME = "github-runner-webhook-router"
 
 
 GITHUB_SELF_HOSTED_ARCH_LABELS = {"x64", "arm64"}
+
+ROOT_USER = "root"
+RUNNER_MANAGER_USER = "runner-manager"
+RUNNER_MANAGER_GROUP = "runner-manager"
+
+ACTIVE_STATUS_RECONCILIATION_FAILED_MSG = "Last reconciliation failed."
+FAILED_TO_RECONCILE_RUNNERS_MSG = "Failed to reconcile runners"
+FAILED_RECONCILE_ACTION_ERR_MSG = (
+    "Failed to reconcile runners. Look at the juju logs for more information."
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +466,12 @@ class GithubRunnerCharm(CharmBase):
             raise
 
         try:
+            _setup_runner_manager_user()
+        except SubprocessError:
+            logger.error("Failed to setup runner manager user")
+            raise
+
+        try:
             logrotate.setup()
         except LogrotateSetupError:
             logger.error("Failed to setup logrotate")
@@ -516,8 +534,7 @@ class GithubRunnerCharm(CharmBase):
             if not self._get_set_image_ready_status():
                 return
             runner_scaler = self._get_runner_scaler(state)
-            runner_scaler.reconcile(state.runner_config.virtual_machines)
-            self.unit.status = ActiveStatus()
+            self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
             return
 
         runner_manager = self._get_runner_manager(state)
@@ -529,14 +546,14 @@ class GithubRunnerCharm(CharmBase):
         self.unit.status = MaintenanceStatus("Starting runners")
         try:
             runner_manager.flush(LXDFlushMode.FLUSH_IDLE)
-            self._reconcile_runners(
+            self._reconcile_lxd_runners(
                 runner_manager,
                 state.runner_config.virtual_machines,
                 state.runner_config.virtual_machine_resources,
             )
         except RunnerError as err:
             logger.exception("Failed to start runners")
-            self.unit.status = MaintenanceStatus(f"Failed to start runners: {err}")
+            self.unit.status = ActiveStatus(f"Failed to start runners: {err}")
             return
 
         self.unit.status = ActiveStatus()
@@ -612,7 +629,7 @@ class GithubRunnerCharm(CharmBase):
         runner_manager = self._get_runner_manager(state)
         logger.info("Flushing the runners...")
         runner_manager.flush(LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK)
-        self._reconcile_runners(
+        self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -657,9 +674,10 @@ class GithubRunnerCharm(CharmBase):
             if state.charm_config.token != self._stored.token:
                 runner_scaler = self._get_runner_scaler(state)
                 runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
-                runner_scaler.reconcile(state.runner_config.virtual_machines)
+                self._reconcile_openstack_runners(
+                    runner_scaler, state.runner_config.virtual_machines
+                )
                 # TODO: 2024-04-12: Flush on token changes.
-                self.unit.status = ActiveStatus()
             return
 
         self._refresh_firewall(state)
@@ -668,7 +686,7 @@ class GithubRunnerCharm(CharmBase):
         if state.charm_config.token != self._stored.token:
             runner_manager.flush(LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK)
             self._stored.token = state.charm_config.token
-        self._reconcile_runners(
+        self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -757,8 +775,7 @@ class GithubRunnerCharm(CharmBase):
             if not self._get_set_image_ready_status():
                 return
             runner_scaler = self._get_runner_scaler(state)
-            runner_scaler.reconcile(state.runner_config.virtual_machines)
-            self.unit.status = ActiveStatus()
+            self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
             return
 
         runner_manager = self._get_runner_manager(state)
@@ -771,7 +788,7 @@ class GithubRunnerCharm(CharmBase):
         if all(not info.busy for info in runner_info):
             self._update_kernel(now=True)
 
-        self._reconcile_runners(
+        self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -848,7 +865,15 @@ class GithubRunnerCharm(CharmBase):
                 return
             runner_scaler = self._get_runner_scaler(state)
 
-            delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
+            self.unit.status = MaintenanceStatus("Reconciling runners")
+            try:
+                delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
+            except ReconcileError:
+                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
+                self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
+                event.fail(FAILED_RECONCILE_ACTION_ERR_MSG)
+                return
+
             self.unit.status = ActiveStatus()
             event.set_results({"delta": {"virtual-machines": delta}})
             return
@@ -859,7 +884,7 @@ class GithubRunnerCharm(CharmBase):
             runner_manager, state.charm_config.token, state.proxy_config
         )
 
-        delta = self._reconcile_runners(
+        delta = self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -882,14 +907,22 @@ class GithubRunnerCharm(CharmBase):
             runner_scaler = self._get_runner_scaler(state)
             flushed = runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
             logger.info("Flushed %s runners", flushed)
-            delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
+            self.unit.status = MaintenanceStatus("Reconciling runners")
+            try:
+                delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
+            except ReconcileError:
+                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
+                self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
+                event.fail(FAILED_RECONCILE_ACTION_ERR_MSG)
+                return
+            self.unit.status = ActiveStatus()
             event.set_results({"delta": {"virtual-machines": delta}})
             return
 
         runner_manager = self._get_runner_manager(state)
 
         runner_manager.flush(LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK)
-        delta = self._reconcile_runners(
+        delta = self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -929,16 +962,16 @@ class GithubRunnerCharm(CharmBase):
 
         if state.instance_type == InstanceType.OPENSTACK:
             runner_scaler = self._get_runner_scaler(state)
-            runner_scaler.flush()
+            runner_scaler.flush(FlushMode.FLUSH_BUSY)
             return
 
         runner_manager = self._get_runner_manager(state)
         runner_manager.flush(LXDFlushMode.FLUSH_BUSY)
 
-    def _reconcile_runners(
+    def _reconcile_lxd_runners(
         self, runner_manager: LXDRunnerManager, num: int, resources: VirtualMachineResources
     ) -> Dict[str, Any]:
-        """Reconcile the current runners state and intended runner state.
+        """Reconcile the current runners state and intended runner state for LXD mode.
 
         Args:
             runner_manager: For querying and managing the runner state.
@@ -963,6 +996,22 @@ class GithubRunnerCharm(CharmBase):
 
         self.unit.status = ActiveStatus()
         return {"delta": {"virtual-machines": delta_virtual_machines}}
+
+    def _reconcile_openstack_runners(self, runner_scaler: RunnerScaler, num: int) -> None:
+        """Reconcile the current runners state and intended runner state for OpenStack mode.
+
+        Args:
+            runner_scaler: Scaler used to scale the amount of runners.
+            num: Target number of runners.
+        """
+        self.unit.status = MaintenanceStatus("Reconciling runners")
+        try:
+            runner_scaler.reconcile(num)
+        except ReconcileError:
+            logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
+            self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
+        else:
+            self.unit.status = ActiveStatus()
 
     def _install_repo_policy_compliance(self, proxy_config: ProxyConfig) -> bool:
         """Install latest version of repo_policy_compliance service.
@@ -1182,15 +1231,17 @@ class GithubRunnerCharm(CharmBase):
             if not self._get_set_image_ready_status():
                 return
             runner_scaler = self._get_runner_scaler(state)
-            # TODO: 2024-04-12: Should be flush idle.
             runner_scaler.flush()
-            runner_scaler.reconcile(state.runner_config.virtual_machines)
+            try:
+                runner_scaler.reconcile(state.runner_config.virtual_machines)
+            except ReconcileError:
+                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
             return
 
         self._refresh_firewall(state)
         runner_manager = self._get_runner_manager(state)
         runner_manager.flush(LXDFlushMode.FLUSH_IDLE)
-        self._reconcile_runners(
+        self._reconcile_lxd_runners(
             runner_manager,
             state.runner_config.virtual_machines,
             state.runner_config.virtual_machine_resources,
@@ -1229,9 +1280,7 @@ class GithubRunnerCharm(CharmBase):
 
         runner_scaler = self._get_runner_scaler(state)
         runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
-        runner_scaler.reconcile(state.runner_config.virtual_machines)
-        self.unit.status = ActiveStatus()
-        return
+        self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
 
     def _get_set_image_ready_status(self) -> bool:
         """Check if image is ready for Openstack and charm status accordingly.
@@ -1294,6 +1343,7 @@ class GithubRunnerCharm(CharmBase):
                 cloud_runner_manager=openstack_runner_manager_config,
                 github_token=token,
                 supported_labels=supported_labels,
+                system_user=SystemUserConfig(user=RUNNER_MANAGER_USER, group=RUNNER_MANAGER_GROUP),
             )
         return RunnerScaler(
             runner_manager=runner_manager, reactive_runner_config=reactive_runner_config
@@ -1334,9 +1384,15 @@ class GithubRunnerCharm(CharmBase):
             logger.warning(
                 "Multiple clouds defined in clouds.yaml. Using the first one to connect."
             )
-        cloud_config = OpenStackCloudConfig(
-            clouds_config=state.charm_config.openstack_clouds_yaml,
-            cloud=clouds[0],
+        first_cloud_config = state.charm_config.openstack_clouds_yaml["clouds"][clouds[0]]
+        credentials = OpenStackCredentials(
+            auth_url=first_cloud_config["auth"]["auth_url"],
+            project_name=first_cloud_config["auth"]["project_name"],
+            username=first_cloud_config["auth"]["username"],
+            password=first_cloud_config["auth"]["password"],
+            user_domain_name=first_cloud_config["auth"]["user_domain_name"],
+            project_domain_name=first_cloud_config["auth"]["project_domain_name"],
+            region_name=first_cloud_config["region_name"],
         )
         server_config = None
         image = state.runner_config.openstack_image
@@ -1358,13 +1414,43 @@ class GithubRunnerCharm(CharmBase):
             name=self.app.name,
             # The prefix is set to f"{application_name}-{unit number}"
             prefix=self.unit.name.replace("/", "-"),
-            cloud_config=cloud_config,
+            credentials=credentials,
             server_config=server_config,
             runner_config=runner_config,
             service_config=service_config,
+            system_user_config=SystemUserConfig(
+                user=RUNNER_MANAGER_USER, group=RUNNER_MANAGER_GROUP
+            ),
         )
         return openstack_runner_manager_config
 
 
+def _setup_runner_manager_user() -> None:
+    """Create the user and required directories for the runner manager."""
+    # check if runner_manager user is already existing
+    _, retcode = execute_command(["/usr/bin/id", RUNNER_MANAGER_USER], check_exit=False)
+    if retcode != 0:
+        logger.info("Creating user %s", RUNNER_MANAGER_USER)
+        execute_command(
+            [
+                "/usr/sbin/useradd",
+                "--system",
+                "--create-home",
+                "--user-group",
+                RUNNER_MANAGER_USER,
+            ],
+        )
+    execute_command(["/usr/bin/mkdir", "-p", f"/home/{RUNNER_MANAGER_USER}/.ssh"])
+    execute_command(
+        [
+            "/usr/bin/chown",
+            "-R",
+            f"{RUNNER_MANAGER_USER}:{RUNNER_MANAGER_USER}",
+            f"/home/{RUNNER_MANAGER_USER}/.ssh",
+        ]
+    )
+    execute_command(["/usr/bin/chmod", "700", f"/home/{RUNNER_MANAGER_USER}/.ssh"])
+
+
 if __name__ == "__main__":
-    main(GithubRunnerCharm)
+    ops.main(GithubRunnerCharm)

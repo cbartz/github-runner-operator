@@ -48,6 +48,8 @@ from tests.integration.helpers.lxd import LXDInstanceHelper, ensure_charm_has_ru
 from tests.integration.helpers.openstack import OpenStackInstanceHelper, PrivateEndpointConfigs
 from tests.status_name import ACTIVE
 
+IMAGE_BUILDER_DEPLOY_TIMEOUT_IN_SECONDS = 30 * 60
+
 # The following line is required because we are using request.getfixturevalue in conjunction
 # with pytest-asyncio. See https://github.com/pytest-dev/pytest-asyncio/issues/112
 nest_asyncio.apply()
@@ -85,7 +87,12 @@ def existing_app(pytestconfig: pytest.Config) -> Optional[str]:
 def app_name(existing_app: Optional[str]) -> str:
     """Randomized application name."""
     # Randomized app name to avoid collision when runner is connecting to GitHub.
-    return existing_app or f"test-{secrets.token_hex(4)}"
+    # The char after the hyphen has to be a letter.
+    return (
+        existing_app
+        or f"test-{random.choice(string.ascii_lowercase)}"
+        f"{''.join(random.choices(string.ascii_lowercase + string.digits, k=7))}"
+    )
 
 
 @pytest.fixture(scope="module", name="openstack_clouds_yaml")
@@ -366,30 +373,37 @@ async def app_no_runner(
 
 @pytest_asyncio.fixture(scope="module", name="image_builder")
 async def image_builder_fixture(
-    model: Model, private_endpoint_config: PrivateEndpointConfigs | None
+    model: Model,
+    private_endpoint_config: PrivateEndpointConfigs | None,
+    existing_app: Optional[str],
 ):
     """The image builder application for OpenStack runners."""
     if not private_endpoint_config:
         raise ValueError("Private endpoints are required for testing OpenStack runners.")
-    app = await model.deploy(
-        "github-runner-image-builder",
-        channel="latest/edge",
-        revision=2,
-        constraints="cores=2 mem=16G root-disk=20G virt-type=virtual-machine",
-        config={
-            "app-channel": "edge",
-            "build-interval": "12",
-            "revision-history-limit": "5",
-            "openstack-auth-url": private_endpoint_config["auth_url"],
-            # Bandit thinks this is a hardcoded password
-            "openstack-password": private_endpoint_config["password"],  # nosec: B105
-            "openstack-project-domain-name": private_endpoint_config["project_domain_name"],
-            "openstack-project-name": private_endpoint_config["project_name"],
-            "openstack-user-domain-name": private_endpoint_config["user_domain_name"],
-            "openstack-user-name": private_endpoint_config["username"],
-        },
-    )
-    await model.wait_for_idle(apps=[app.name], wait_for_active=True, timeout=15 * 60)
+    if not existing_app:
+        app = await model.deploy(
+            "github-runner-image-builder",
+            channel="latest/edge",
+            revision=2,
+            constraints="cores=2 mem=2G root-disk=20G virt-type=virtual-machine",
+            config={
+                "app-channel": "edge",
+                "build-interval": "12",
+                "revision-history-limit": "5",
+                "openstack-auth-url": private_endpoint_config["auth_url"],
+                # Bandit thinks this is a hardcoded password
+                "openstack-password": private_endpoint_config["password"],  # nosec: B105
+                "openstack-project-domain-name": private_endpoint_config["project_domain_name"],
+                "openstack-project-name": private_endpoint_config["project_name"],
+                "openstack-user-domain-name": private_endpoint_config["user_domain_name"],
+                "openstack-user-name": private_endpoint_config["username"],
+            },
+        )
+        await model.wait_for_idle(
+            apps=[app.name], wait_for_active=True, timeout=IMAGE_BUILDER_DEPLOY_TIMEOUT_IN_SECONDS
+        )
+    else:
+        app = model.applications["github-runner-image-builder"]
     return app
 
 
@@ -426,7 +440,7 @@ async def app_openstack_runner_fixture(
             reconcile_interval=60,
             constraints={
                 "root-disk": 50 * 1024,
-                "mem": 16 * 1024,
+                "mem": 2 * 1024,
             },
             config={
                 OPENSTACK_CLOUDS_YAML_CONFIG_NAME: clouds_yaml_contents,
@@ -456,43 +470,28 @@ async def app_one_runner(model: Model, app_no_runner: Application) -> AsyncItera
     return app_no_runner
 
 
-@pytest_asyncio.fixture(scope="module")
-async def app_scheduled_events(
+@pytest_asyncio.fixture(scope="module", name="app_scheduled_events")
+async def app_scheduled_events_fixture(
     model: Model,
-    charm_file: str,
-    app_name: str,
-    path: str,
-    token: str,
-    http_proxy: str,
-    https_proxy: str,
-    no_proxy: str,
-) -> AsyncIterator[Application]:
-    """Application with no token.
-
-    Test should ensure it returns with the application having one runner.
-
-    This fixture has to deploy a new application. The scheduled events are set
-    to one hour in other application to avoid conflicting with the tests.
-    Changes to the duration of scheduled interval only takes effect after the
-    next trigger. Therefore, it would take a hour for the duration change to
-    take effect.
-    """
-    application = await deploy_github_runner_charm(
-        model=model,
-        charm_file=charm_file,
-        app_name=app_name,
-        path=path,
-        token=token,
-        runner_storage="memory",
-        http_proxy=http_proxy,
-        https_proxy=https_proxy,
-        no_proxy=no_proxy,
-        reconcile_interval=8,
-    )
-
+    app_openstack_runner,
+):
+    """Application to check scheduled events."""
+    application = app_openstack_runner
+    await application.set_config({"reconcile-interval": "8"})
     await application.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "1"})
+    await model.wait_for_idle(apps=[application.name], status=ACTIVE, timeout=90 * 60)
     await reconcile(app=application, model=model)
+    return application
 
+
+@pytest_asyncio.fixture(scope="module", name="app_no_wait_tmate")
+async def app_no_wait_tmate_fixture(
+    model: Model,
+    app_openstack_runner,
+):
+    """Application to check tmate ssh with openstack without waiting for active."""
+    application = app_openstack_runner
+    await application.set_config({"reconcile-interval": "60", VIRTUAL_MACHINES_CONFIG_NAME: "1"})
     return application
 
 
@@ -555,11 +554,11 @@ async def app_no_wait_fixture(
 
 @pytest_asyncio.fixture(scope="module", name="tmate_ssh_server_app")
 async def tmate_ssh_server_app_fixture(
-    model: Model, app_no_wait: Application
+    model: Model, app_no_wait_tmate: Application
 ) -> AsyncIterator[Application]:
     """tmate-ssh-server charm application related to GitHub-Runner app charm."""
     tmate_app: Application = await model.deploy("tmate-ssh-server", channel="edge")
-    await app_no_wait.relate("debug-ssh", f"{tmate_app.name}:debug-ssh")
+    await app_no_wait_tmate.relate("debug-ssh", f"{tmate_app.name}:debug-ssh")
     await model.wait_for_idle(apps=[tmate_app.name], status=ACTIVE, timeout=60 * 30)
 
     return tmate_app
@@ -769,7 +768,6 @@ async def app_for_reactive_fixture(
     if not existing_app:
         await model.relate(f"{app_openstack_runner.name}:mongodb", f"{mongodb.name}:database")
 
-    await app_openstack_runner.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "1"})
     await model.wait_for_idle(apps=[app_openstack_runner.name, mongodb.name], status=ACTIVE)
 
     return app_openstack_runner

@@ -3,9 +3,5 @@
 
 check-runners:
     description: Get info on active and registered runners
-reconcile-runners:
-    description: Remove offline runners and replace any missing runners
 flush-runners:
     description: Clear out all runners and start a new set
-update-dependencies:
-    description: Update GitHub self-hosted runner binary and services used by the charm

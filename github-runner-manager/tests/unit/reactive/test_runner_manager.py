@@ -1,11 +1,14 @@
 #  Copyright 2025 Canonical Ltd.
 #  See LICENSE file for licensing details.
+import logging
+from dataclasses import fields
 from random import randint
 from unittest.mock import MagicMock
 
 import pytest
 
 import github_runner_manager.reactive.process_manager
+from github_runner_manager.configuration import UserInfo
 from github_runner_manager.manager.runner_manager import (
     FlushMode,
     IssuedMetricEventsStats,
@@ -13,8 +16,11 @@ from github_runner_manager.manager.runner_manager import (
     RunnerManager,
 )
 from github_runner_manager.metrics.events import RunnerStart, RunnerStop
+from github_runner_manager.platform.platform_provider import PlatformRunnerState
 from github_runner_manager.reactive.runner_manager import reconcile
-from github_runner_manager.reactive.types_ import QueueConfig, RunnerConfig
+from github_runner_manager.reactive.types_ import QueueConfig, ReactiveProcessConfig
+
+logger = logging.getLogger(__name__)
 
 TEST_METRIC_EVENTS = {RunnerStart: 1, RunnerStop: 2}
 TEST_DELETE_RUNNER_METRIC_EVENTS = {RunnerStart: 1, RunnerStop: 1}
@@ -41,12 +47,12 @@ def reactive_process_manager_fixture(monkeypatch: pytest.MonkeyPatch) -> MagicMo
     return reactive_process_manager
 
 
-@pytest.fixture(name="runner_config")
-def runner_config_fixture():
-    """Return a mock of the RunnerConfig."""
-    runner_config = MagicMock(spec=RunnerConfig)
-    runner_config.queue = MagicMock(spec=QueueConfig)
-    return runner_config
+@pytest.fixture(name="reactive_process_config")
+def reactive_process_config_fixture():
+    """Return a mock of the ReactiveProcessConfig."""
+    reactive_process_config = MagicMock(spec=ReactiveProcessConfig)
+    reactive_process_config.queue = MagicMock(spec=QueueConfig)
+    return reactive_process_config
 
 
 @pytest.mark.parametrize(
@@ -65,7 +71,8 @@ def test_reconcile_positive_runner_diff(
     expected_process_quantity: int,
     runner_manager: MagicMock,
     reactive_process_manager: MagicMock,
-    runner_config: MagicMock,
+    reactive_process_config: MagicMock,
+    user_info: UserInfo,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """
@@ -74,16 +81,23 @@ def test_reconcile_positive_runner_diff(
     assert: The cleanup method of runner manager is called and the reconcile method of
         process manager is called with the expected quantity.
     """
-    runner_manager.get_runners = MagicMock(
-        return_value=(tuple(MagicMock(spec=RunnerInstance) for _ in range(runner_quantity)))
-    )
+    runners = [
+        MagicMock(spec=[field.name for field in fields(RunnerInstance)])
+        for _ in range(runner_quantity)
+    ]
+    for runner in runners:
+        runner.platform_state = PlatformRunnerState.IDLE
+    runner_manager.get_runners.return_value = tuple(runners)
     _set_queue_non_empty(monkeypatch)
 
-    reconcile(desired_quantity, runner_manager, runner_config)
+    reconcile(desired_quantity, runner_manager, reactive_process_config, user_info)
 
     runner_manager.cleanup.assert_called_once()
     reactive_process_manager.reconcile.assert_called_once_with(
-        quantity=expected_process_quantity, runner_config=runner_config
+        quantity=expected_process_quantity,
+        reactive_process_config=reactive_process_config,
+        user=user_info,
+        python_path=None,
     )
 
 
@@ -101,7 +115,8 @@ def test_reconcile_negative_runner_diff(
     expected_number_of_runners_to_delete: int,
     runner_manager: MagicMock,
     reactive_process_manager: MagicMock,
-    runner_config: MagicMock,
+    reactive_process_config: MagicMock,
+    user_info: UserInfo,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """
@@ -110,24 +125,33 @@ def test_reconcile_negative_runner_diff(
     assert: The additional amount of runners are deleted and the reconcile method of the
         process manager is called with zero quantity.
     """
-    runner_manager.get_runners = MagicMock(
-        return_value=(tuple(MagicMock(spec=RunnerInstance) for _ in range(runner_quantity)))
-    )
+    runners = [
+        MagicMock(spec=[field.name for field in fields(RunnerInstance)])
+        for _ in range(runner_quantity)
+    ]
+    for runner in runners:
+        runner.platform_state = PlatformRunnerState.IDLE
+
+    runner_manager.get_runners.return_value = tuple(runners)
     _set_queue_non_empty(monkeypatch)
 
-    reconcile(desired_quantity, runner_manager, runner_config)
+    reconcile(desired_quantity, runner_manager, reactive_process_config, user_info)
 
     runner_manager.cleanup.assert_called_once()
     runner_manager.delete_runners.assert_called_once_with(expected_number_of_runners_to_delete)
     reactive_process_manager.reconcile.assert_called_once_with(
-        quantity=0, runner_config=runner_config
+        quantity=0,
+        reactive_process_config=reactive_process_config,
+        user=user_info,
+        python_path=None,
     )
 
 
 def test_reconcile_flushes_idle_runners_when_queue_is_empty(
     runner_manager: MagicMock,
     reactive_process_manager: MagicMock,
-    runner_config: MagicMock,
+    reactive_process_config: MagicMock,
+    user_info: UserInfo,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """
@@ -138,7 +162,7 @@ def test_reconcile_flushes_idle_runners_when_queue_is_empty(
     quantity = randint(0, 10)
     _set_queue_empty(monkeypatch)
 
-    reconcile(quantity, runner_manager, runner_config)
+    reconcile(quantity, runner_manager, reactive_process_config, user_info)
 
     runner_manager.flush_runners.assert_called_once_with(FlushMode.FLUSH_IDLE)
 
@@ -264,7 +288,8 @@ def test_reconcile_returns_issued_metrics(
     delete_metric_stats: IssuedMetricEventsStats,
     expected_metrics: IssuedMetricEventsStats,
     runner_manager: MagicMock,
-    runner_config: MagicMock,
+    reactive_process_config: MagicMock,
+    user_info: UserInfo,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """
@@ -272,15 +297,19 @@ def test_reconcile_returns_issued_metrics(
     act: Call reconcile.
     assert: The returned metrics are as expected.
     """
-    runner_manager.get_runners = MagicMock(
-        return_value=(tuple(MagicMock(spec=RunnerInstance) for _ in range(runner_quantity)))
-    )
+    runners = [
+        MagicMock(spec=[field.name for field in fields(RunnerInstance)])
+        for _ in range(runner_quantity)
+    ]
+    for runner in runners:
+        runner.platform_state = PlatformRunnerState.IDLE
+    runner_manager.get_runners.return_value = tuple(runners)
     runner_manager.cleanup.return_value = cleanup_metric_stats
     runner_manager.delete_runners.return_value = delete_metric_stats
 
     _set_queue_non_empty(monkeypatch)
 
-    result = reconcile(desired_quantity, runner_manager, runner_config)
+    result = reconcile(desired_quantity, runner_manager, reactive_process_config, user_info)
 
     assert result.metric_stats == expected_metrics
 
@@ -397,7 +426,8 @@ def test_reconcile_empty_queue_returns_issued_metrics(
     flush_metric_stats: IssuedMetricEventsStats,
     expected_metrics: IssuedMetricEventsStats,
     runner_manager: MagicMock,
-    runner_config: MagicMock,
+    reactive_process_config: MagicMock,
+    user_info: UserInfo,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """
@@ -405,16 +435,20 @@ def test_reconcile_empty_queue_returns_issued_metrics(
     act: Call reconcile.
     assert: The returned metrics are as expected.
     """
-    runner_manager.get_runners = MagicMock(
-        return_value=(tuple(MagicMock(spec=RunnerInstance) for _ in range(runner_quantity)))
-    )
+    runners = [
+        MagicMock(spec=[field.name for field in fields(RunnerInstance)])
+        for _ in range(runner_quantity)
+    ]
+    for runner in runners:
+        runner.platform_state = PlatformRunnerState.IDLE
+    runner_manager.get_runners.return_value = tuple(runners)
     runner_manager.cleanup.return_value = cleanup_metric_stats
     runner_manager.delete_runners.return_value = delete_metric_stats
     runner_manager.flush_runners.return_value = flush_metric_stats
 
     _set_queue_empty(monkeypatch)
 
-    result = reconcile(desired_quantity, runner_manager, runner_config)
+    result = reconcile(desired_quantity, runner_manager, reactive_process_config, user_info)
 
     assert result.metric_stats == expected_metrics
 

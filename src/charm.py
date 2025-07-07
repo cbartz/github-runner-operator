@@ -3,11 +3,9 @@
 # Copyright 2025 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-# TODO: 2024-03-12 The module contains too many lines which are scheduled for refactoring.
-# pylint: disable=too-many-lines
-
 """Charm for creating and managing GitHub self-hosted runner instances."""
-from utilities import bytes_with_unit_to_kib, execute_command, remove_residual_venv_dirs, retry
+
+from utilities import execute_command, remove_residual_venv_dirs
 
 # This is a workaround for https://bugs.launchpad.net/juju/+bug/2058335
 # It is important that this is run before importation of any other modules.
@@ -17,39 +15,20 @@ remove_residual_venv_dirs()
 
 
 import functools
+import json
 import logging
-import os
-import secrets
+import pathlib
 import shutil
-import urllib.error
-from pathlib import Path
-from typing import Any, Callable, Dict, Sequence, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
-import jinja2
 import ops
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
-from github_runner_manager.errors import ReconcileError
-from github_runner_manager.manager.cloud_runner_manager import (
-    GitHubRunnerConfig,
-    SupportServiceConfig,
-)
-from github_runner_manager.manager.runner_manager import (
-    FlushMode,
-    RunnerManager,
-    RunnerManagerConfig,
-)
-from github_runner_manager.manager.runner_scaler import RunnerScaler
-from github_runner_manager.openstack_cloud.openstack_runner_manager import (
-    OpenStackCredentials,
-    OpenStackRunnerManager,
-    OpenStackRunnerManagerConfig,
-    OpenStackServerConfig,
-)
-from github_runner_manager.reactive.types_ import QueueConfig as ReactiveQueueConfig
-from github_runner_manager.reactive.types_ import RunnerConfig as ReactiveRunnerConfig
-from github_runner_manager.types_ import SystemUserConfig
-from github_runner_manager.types_.github import GitHubPath, GitHubRunnerStatus, parse_github_path
+from charms.operator_libs_linux.v1 import systemd
+from github_runner_manager import constants
+from github_runner_manager.metrics.events import METRICS_LOG_PATH
+from github_runner_manager.platform.platform_provider import TokenError
+from github_runner_manager.utilities import set_env_var
 from ops.charm import (
     ActionEvent,
     CharmBase,
@@ -65,60 +44,44 @@ from ops.framework import StoredState
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, WaitingStatus
 
 import logrotate
+import manager_service
 from charm_state import (
     DEBUG_SSH_INTEGRATION_NAME,
-    GROUP_CONFIG_NAME,
     IMAGE_INTEGRATION_NAME,
     LABELS_CONFIG_NAME,
+    MONGO_DB_INTEGRATION_NAME,
     PATH_CONFIG_NAME,
-    RECONCILE_INTERVAL_CONFIG_NAME,
-    TEST_MODE_CONFIG_NAME,
     TOKEN_CONFIG_NAME,
     CharmConfigInvalidError,
     CharmState,
-    InstanceType,
     OpenstackImage,
-    ProxyConfig,
-    RunnerStorage,
-    VirtualMachineResources,
+    build_proxy_config_from_charm,
 )
 from errors import (
     ConfigurationError,
+    ImageIntegrationMissingError,
+    ImageNotFoundError,
     LogrotateSetupError,
     MissingMongoDBError,
-    MissingRunnerBinaryError,
-    RunnerBinaryError,
-    RunnerError,
+    RunnerManagerApplicationError,
+    RunnerManagerApplicationInstallError,
+    RunnerManagerServiceError,
     SubprocessError,
-    TokenError,
 )
-from event_timer import EventTimer, TimerStatusError
-from firewall import Firewall, FirewallEntry
-from runner import LXD_PROFILE_YAML
-from runner_manager import LXDRunnerManager, LXDRunnerManagerConfig
-from runner_manager_type import LXDFlushMode
-
-# We assume a stuck reconcile event when it takes longer
-# than 10 times a normal interval. Currently, we are only aware of
-# https://bugs.launchpad.net/juju/+bug/2055184 causing a stuck reconcile event.
-RECONCILIATION_INTERVAL_TIMEOUT_FACTOR = 10
-RECONCILE_RUNNERS_EVENT = "reconcile-runners"
+from manager_client import GitHubRunnerManagerClient
 
 # This is currently hardcoded and may be moved to a config option in the future.
 REACTIVE_MQ_DB_NAME = "github-runner-webhook-router"
 
-
-GITHUB_SELF_HOSTED_ARCH_LABELS = {"x64", "arm64"}
-
-ROOT_USER = "root"
-RUNNER_MANAGER_USER = "runner-manager"
-RUNNER_MANAGER_GROUP = "runner-manager"
 
 ACTIVE_STATUS_RECONCILIATION_FAILED_MSG = "Last reconciliation failed."
 FAILED_TO_RECONCILE_RUNNERS_MSG = "Failed to reconcile runners"
 FAILED_RECONCILE_ACTION_ERR_MSG = (
     "Failed to reconcile runners. Look at the juju logs for more information."
 )
+UPGRADE_MSG = "Upgrading github-runner charm."
+LEGACY_RECONCILE_TIMER_SERVICE = "ghro.reconcile-runners.timer"
+LEGACY_RECONCILE_SERVICE = "ghro.reconcile-runners.service"
 
 
 logger = logging.getLogger(__name__)
@@ -132,7 +95,7 @@ EventT = TypeVar("EventT")
 
 
 def catch_charm_errors(
-    func: Callable[["GithubRunnerCharm", EventT], None]
+    func: Callable[["GithubRunnerCharm", EventT], None],
 ) -> Callable[["GithubRunnerCharm", EventT], None]:
     """Catch common errors in charm.
 
@@ -159,21 +122,23 @@ def catch_charm_errors(
         except TokenError as err:
             logger.exception("Issue with GitHub token")
             self.unit.status = BlockedStatus(str(err))
-        except MissingRunnerBinaryError:
-            logger.exception("Missing runner binary")
-            self.unit.status = MaintenanceStatus(
-                "GitHub runner application not downloaded; the charm will retry download on "
-                "reconcile interval"
-            )
         except MissingMongoDBError as err:
             logger.exception("Missing integration data")
             self.unit.status = WaitingStatus(str(err))
+        except ImageIntegrationMissingError:
+            logger.exception("Missing image integration.")
+            self.unit.status = BlockedStatus("Please provide image integration.")
+            manager_service.stop()
+        except ImageNotFoundError:
+            logger.exception("Missing image in image integration.")
+            self.unit.status = WaitingStatus("Waiting for image over integration.")
+            manager_service.stop()
 
     return func_with_catch_errors
 
 
 def catch_action_errors(
-    func: Callable[["GithubRunnerCharm", ActionEvent], None]
+    func: Callable[["GithubRunnerCharm", ActionEvent], None],
 ) -> Callable[["GithubRunnerCharm", ActionEvent], None]:
     """Catch common errors in actions.
 
@@ -198,40 +163,17 @@ def catch_action_errors(
             logger.exception("Issue with charm configuration")
             self.unit.status = BlockedStatus(str(err))
             event.fail(str(err))
-        except MissingRunnerBinaryError:
-            logger.exception("Missing runner binary")
-            err_msg = (
-                "GitHub runner application not downloaded; the charm will retry download on "
-                "reconcile interval"
-            )
-            self.unit.status = MaintenanceStatus(err_msg)
-            event.fail(err_msg)
+        except RunnerManagerServiceError as err:
+            logger.exception("Failed runner manager request")
+            event.fail(f"Failed runner manager request: {str(err)}")
 
     return func_with_catch_errors
 
 
 class GithubRunnerCharm(CharmBase):
-    """Charm for managing GitHub self-hosted runners.
-
-    Attributes:
-        service_token_path: The path to token to access local services.
-        repo_check_web_service_path: The path to repo-policy-compliance service directory.
-        repo_check_web_service_script: The path to repo-policy-compliance web service script.
-        repo_check_systemd_service: The path to repo-policy-compliance unit file.
-        juju_storage_path: The path to juju storage.
-        ram_pool_path: The path to memdisk storage.
-        kernel_module_path: The path to kernel modules.
-    """
+    """Charm for managing GitHub self-hosted runners."""
 
     _stored = StoredState()
-
-    service_token_path = Path("service_token")
-    repo_check_web_service_path = Path("/home/ubuntu/repo_policy_compliance_service")
-    repo_check_web_service_script = Path("scripts/repo_policy_compliance_service.py")
-    repo_check_systemd_service = Path("/etc/systemd/system/repo-policy-compliance.service")
-    juju_storage_path = Path("/storage/juju")
-    ram_pool_path = Path("/storage/ram")
-    kernel_module_path = Path("/etc/modules")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Construct the charm.
@@ -240,26 +182,16 @@ class GithubRunnerCharm(CharmBase):
             args: List of arguments to be passed to the `CharmBase` class.
             kwargs: List of keyword arguments to be passed to the `CharmBase`
                 class.
-
-        Raises:
-            RuntimeError: If invalid test configuration was detected.
         """
         super().__init__(*args, **kwargs)
+        self._log_charm_status()
+
         self._grafana_agent = COSAgentProvider(self)
-
-        self.service_token: str | None = None
-        self._event_timer = EventTimer(self.unit.name)
-
-        if LXD_PROFILE_YAML.exists():
-            if self.config.get(TEST_MODE_CONFIG_NAME) != "insecure":
-                raise RuntimeError("lxd-profile.yaml detected outside test mode")
-            logger.critical("test mode is enabled")
 
         self._stored.set_default(
             path=self.config[PATH_CONFIG_NAME],  # for detecting changes
             token=self.config[TOKEN_CONFIG_NAME],  # for detecting changes
             labels=self.config[LABELS_CONFIG_NAME],  # for detecting changes
-            runner_bin_url=None,
         )
 
         self.on.define_event("reconcile_runners", ReconcileRunnersEvent)
@@ -281,19 +213,22 @@ class GithubRunnerCharm(CharmBase):
             self.on[IMAGE_INTEGRATION_NAME].relation_changed,
             self._on_image_relation_changed,
         )
-        self.framework.observe(self.on.reconcile_runners, self._on_reconcile_runners)
         self.framework.observe(self.on.check_runners_action, self._on_check_runners_action)
-        self.framework.observe(self.on.reconcile_runners_action, self._on_reconcile_runners_action)
         self.framework.observe(self.on.flush_runners_action, self._on_flush_runners_action)
-        self.framework.observe(
-            self.on.update_dependencies_action, self._on_update_dependencies_action
-        )
         self.framework.observe(self.on.update_status, self._on_update_status)
         self.database = DatabaseRequires(
             self, relation_name="mongodb", database_name=REACTIVE_MQ_DB_NAME
         )
         self.framework.observe(self.database.on.database_created, self._on_database_created)
         self.framework.observe(self.database.on.endpoints_changed, self._on_endpoints_changed)
+        self.framework.observe(
+            self.on[MONGO_DB_INTEGRATION_NAME].relation_broken, self._on_mongodb_relation_broken
+        )
+
+        self._manager_client = GitHubRunnerManagerClient(
+            host=manager_service.GITHUB_RUNNER_MANAGER_ADDRESS,
+            port=manager_service.GITHUB_RUNNER_MANAGER_PORT,
+        )
 
     def _setup_state(self) -> CharmState:
         """Set up the charm state.
@@ -309,148 +244,22 @@ class GithubRunnerCharm(CharmBase):
         except CharmConfigInvalidError as exc:
             raise ConfigurationError(exc.msg) from exc
 
-    def _create_memory_storage(self, path: Path, size: int) -> None:
-        """Create a tmpfs-based LVM volume group.
+    def _set_proxy_env_var(self) -> None:
+        """Set the HTTP proxy environment variables."""
+        proxy_config = build_proxy_config_from_charm()
 
-        Args:
-            path: Path to directory for memory storage.
-            size: Size of the tmpfs in kilobytes.
+        if proxy_config.no_proxy is not None:
+            set_env_var("NO_PROXY", proxy_config.no_proxy)
+            set_env_var("no_proxy", proxy_config.no_proxy)
+        if proxy_config.http is not None:
+            set_env_var("HTTP_PROXY", proxy_config.http)
+            set_env_var("http_proxy", proxy_config.http)
+        if proxy_config.https is not None:
+            set_env_var("HTTPS_PROXY", proxy_config.https)
+            set_env_var("https_proxy", proxy_config.https)
 
-        Raises:
-            RunnerError: Unable to setup storage for runner.
-        """
-        if size <= 0:
-            return
-
-        try:
-            # Create tmpfs if not exists, else resize it.
-            if not path.exists():
-                path.mkdir(parents=True, exist_ok=True)
-                execute_command(
-                    ["mount", "-t", "tmpfs", "-o", f"size={size}k", "tmpfs", str(path)]
-                )
-            else:
-                execute_command(["mount", "-o", f"remount,size={size}k", str(path)])
-        except (OSError, SubprocessError) as err:
-            logger.exception("Unable to setup storage directory")
-            # Remove the path if is not in use. If the tmpfs is in use, the removal will fail.
-            if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
-                path.rmdir()
-                logger.info("Cleaned up storage directory")
-            raise RunnerError("Failed to configure runner storage") from err
-
-    @retry(tries=5, delay=5, max_delay=60, backoff=2, local_logger=logger)
-    def _ensure_runner_storage(self, size: int, runner_storage: RunnerStorage) -> Path:
-        """Ensure the runner storage is setup.
-
-        Args:
-            size: Size of the storage needed in kibibytes.
-            runner_storage: Type of storage to use for virtual machine hosting the runners.
-
-        Raises:
-            ConfigurationError: If there was an error with runner stoarge configuration.
-
-        Returns:
-            Runner storage path.
-        """
-        match runner_storage:
-            case RunnerStorage.MEMORY:
-                logger.info("Creating tmpfs storage")
-                path = self.ram_pool_path
-                self._create_memory_storage(self.ram_pool_path, size)
-            case RunnerStorage.JUJU_STORAGE:
-                path = self.juju_storage_path
-
-        # tmpfs storage is not created if required size is 0.
-        if size > 0:
-            # Check if the storage mounted has enough space
-            disk = shutil.disk_usage(path)
-            # Some storage space might be used by existing runners.
-            if size * 1024 > disk.total:
-                raise ConfigurationError(
-                    (
-                        f"Required disk space for runners {size / 1024}MiB is greater than "
-                        f"storage total size {disk.total / 1024 / 1024}MiB"
-                    )
-                )
-        return path
-
-    @retry(tries=5, delay=5, max_delay=60, backoff=2, local_logger=logger)
-    def _ensure_service_health(self) -> None:
-        """Ensure services managed by the charm is healthy.
-
-        Services managed include:
-        * repo-policy-compliance
-
-        Raises:
-            SubprocessError: if there was an error starting repo-policy-compliance service.
-        """
-        logger.info("Checking health of repo-policy-compliance service")
-        try:
-            execute_command(["/usr/bin/systemctl", "is-active", "repo-policy-compliance"])
-        except SubprocessError:
-            logger.exception("Found inactive repo-policy-compliance service.")
-            execute_command(["/usr/bin/systemctl", "restart", "repo-policy-compliance"])
-            logger.info("Restart repo-policy-compliance service")
-            raise
-
-    def _get_runner_manager(
-        self, state: CharmState, token: str | None = None, path: GitHubPath | None = None
-    ) -> LXDRunnerManager:
-        """Get a RunnerManager instance.
-
-        Args:
-            state: Charm state.
-            token: GitHub personal access token to manage the runners with. If None the token in
-                charm state is used.
-            path: GitHub repository path in the format '<org>/<repo>', or the GitHub organization
-                name. If None the path in charm state is used.
-
-        Returns:
-            An instance of RunnerManager.
-        """
-        if token is None:
-            token = state.charm_config.token
-        if path is None:
-            path = state.charm_config.path
-
-        self._ensure_service_health()
-
-        size_in_kib = (
-            bytes_with_unit_to_kib(state.runner_config.virtual_machine_resources.disk)
-            * state.runner_config.virtual_machines
-        )
-        lxd_storage_path = self._ensure_runner_storage(
-            size_in_kib, state.runner_config.runner_storage
-        )
-
-        if self.service_token is None:
-            self.service_token = self._get_service_token()
-
-        app_name, unit = self.unit.name.rsplit("/", 1)
-
-        return LXDRunnerManager(
-            app_name,
-            unit,
-            LXDRunnerManagerConfig(
-                charm_state=state,
-                dockerhub_mirror=state.charm_config.dockerhub_mirror,
-                image=state.runner_config.base_image.value,
-                lxd_storage_path=lxd_storage_path,
-                path=path,
-                reactive_config=state.reactive_config,
-                service_token=self.service_token,
-                token=token,
-            ),
-        )
-
-    # Pending refactor for RunnerManager class which will unify logic for OpenStack and LXD.
-    def _common_install_code(self, state: CharmState) -> bool:  # noqa: C901
+    def _common_install_code(self) -> bool:
         """Installation code shared between install and upgrade hook.
-
-        Args:
-            state: The charm state instance.
 
         Raises:
             LogrotateSetupError: Failed to setup logrotate.
@@ -459,6 +268,8 @@ class GithubRunnerCharm(CharmBase):
         Returns:
             True if installation was successful, False otherwise.
         """
+        self._set_proxy_env_var()
+
         try:
             self._install_deps()
         except SubprocessError:
@@ -472,129 +283,99 @@ class GithubRunnerCharm(CharmBase):
             raise
 
         try:
+            manager_service.install_package()
+        except RunnerManagerApplicationInstallError:
+            logger.error("Failed to install github runner manager package")
+            # Not re-raising error for until the github-runner-manager service replaces the
+            # library.
+
+        try:
             logrotate.setup()
         except LogrotateSetupError:
             logger.error("Failed to setup logrotate")
             raise
 
-        if state.instance_type == InstanceType.OPENSTACK:
-            return True
-
-        self.unit.status = MaintenanceStatus("Installing packages")
-        try:
-            # The `_start_services`, `_install_deps` includes retry.
-            self._install_local_lxd_deps()
-            self._start_services(state.charm_config.token, state.proxy_config)
-        except SubprocessError:
-            logger.error("Failed to install or start local LXD runner dependencies")
-            raise
-
-        self._refresh_firewall(state)
-
-        runner_manager = self._get_runner_manager(state)
-        if not runner_manager.has_runner_image():
-            self.unit.status = MaintenanceStatus("Building runner image")
-            runner_manager.build_runner_image()
-        runner_manager.schedule_build_runner_image()
-
-        self._set_reconcile_timer()
-
-        self.unit.status = MaintenanceStatus("Downloading runner binary")
-        try:
-            runner_info = runner_manager.get_latest_runner_bin_url()
-            logger.info(
-                "Downloading %s from: %s", runner_info["filename"], runner_info["download_url"]
-            )
-            self._stored.runner_bin_url = runner_info["download_url"]
-            runner_manager.update_runner_bin(runner_info)
-        # Safe guard against transient unexpected error.
-        except RunnerBinaryError as err:
-            logger.exception("Failed to update runner binary")
-            # Failure to download runner binary is a transient error.
-            # The charm automatically update runner binary on a schedule.
-            self.unit.status = MaintenanceStatus(f"Failed to update runner binary: {err}")
-            return False
-
-        self.unit.status = ActiveStatus()
         return True
 
     @catch_charm_errors
     def _on_install(self, _: InstallEvent) -> None:
         """Handle the installation of charm."""
-        state = self._setup_state()
-        self._common_install_code(state)
+        self._common_install_code()
 
     @catch_charm_errors
     def _on_start(self, _: StartEvent) -> None:
         """Handle the start of the charm."""
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            self.unit.status = MaintenanceStatus("Starting runners")
-            if not self._get_set_image_ready_status():
-                return
-            runner_scaler = self._get_runner_scaler(state)
-            self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
-            return
-
-        runner_manager = self._get_runner_manager(state)
-
-        self._check_and_update_local_lxd_dependencies(
-            runner_manager, state.charm_config.token, state.proxy_config
-        )
-
-        self.unit.status = MaintenanceStatus("Starting runners")
-        try:
-            runner_manager.flush(LXDFlushMode.FLUSH_IDLE)
-            self._reconcile_lxd_runners(
-                runner_manager,
-                state.runner_config.virtual_machines,
-                state.runner_config.virtual_machine_resources,
-            )
-        except RunnerError as err:
-            logger.exception("Failed to start runners")
-            self.unit.status = ActiveStatus(f"Failed to start runners: {err}")
-            return
-
+        self._check_image_ready()
         self.unit.status = ActiveStatus()
 
-    def _update_kernel(self, now: bool = False) -> None:
-        """Update the Linux kernel if new version is available.
+    @catch_charm_errors
+    def _on_upgrade_charm(self, _: UpgradeCharmEvent) -> None:
+        """Handle the update of charm."""
+        logger.info(UPGRADE_MSG)
+        self._common_install_code()
+        _disable_legacy_service()
 
-        Do nothing if no new version is available, else update the kernel and reboot.
-        This method should only call by event handlers, and not action handlers. As juju-reboot
-        only works with events.
+    @catch_charm_errors
+    def _on_config_changed(self, _: ConfigChangedEvent) -> None:
+        """Handle the configuration change."""
+        state = self._setup_state()
+
+        flush_runners = False
+        if state.charm_config.token != self._stored.token:
+            self._stored.token = self.config[TOKEN_CONFIG_NAME]
+            flush_runners = True
+        if self.config[PATH_CONFIG_NAME] != self._stored.path:
+            self._stored.path = self.config[PATH_CONFIG_NAME]
+            flush_runners = True
+        if self.config[LABELS_CONFIG_NAME] != self._stored.labels:
+            self._stored.labels = self.config[LABELS_CONFIG_NAME]
+            flush_runners = True
+
+        self._check_image_ready()
+
+        self._setup_service(state)
+
+        if flush_runners:
+            logger.info("Flush runners on config-changed")
+            self._manager_client.flush_runner()
+        self.unit.status = ActiveStatus()
+
+    @catch_action_errors
+    def _on_check_runners_action(self, event: ActionEvent) -> None:
+        """Handle the action of checking of runner state.
 
         Args:
-            now: Whether the reboot should trigger at end of event handler or now.
+            event: The event fired on check_runners action.
         """
-        logger.info("Updating kernel (if available)")
-        self._apt_install(["linux-generic"])
+        info = self._manager_client.check_runner()
+        event.set_results(info)
 
-        _, exit_code = execute_command(["ls", "/var/run/reboot-required"], check_exit=False)
-        if exit_code == 0:
-            logger.info("Rebooting system...")
-            self.unit.reboot(now=now)
+    @catch_action_errors
+    def _on_flush_runners_action(self, _: ActionEvent) -> None:
+        """Handle the action of flushing all runner and reconciling afterwards."""
+        self._manager_client.flush_runner()
 
-    def _set_reconcile_timer(self) -> None:
-        """Set the timer for regular reconciliation checks."""
-        self._event_timer.ensure_event_timer(
-            event_name="reconcile-runners",
-            interval=int(self.config[RECONCILE_INTERVAL_CONFIG_NAME]),
-            timeout=RECONCILIATION_INTERVAL_TIMEOUT_FACTOR
-            * int(self.config[RECONCILE_INTERVAL_CONFIG_NAME]),
-        )
+    @catch_charm_errors
+    def _on_update_status(self, _: UpdateStatusEvent) -> None:
+        """Handle the update of charm status."""
+        self._log_juju_processes()
 
-    def _ensure_reconcile_timer_is_active(self) -> None:
-        """Ensure the timer for reconciliation event is active."""
+    def _setup_service(self, state: CharmState) -> None:
+        """Set up services.
+
+        Args:
+            state: The charm state.
+
+        Raises:
+            RunnerManagerApplicationError: The runner manager service is not ready for requests or
+                has errors.
+        """
         try:
-            reconcile_timer_is_active = self._event_timer.is_active(RECONCILE_RUNNERS_EVENT)
-        except TimerStatusError:
-            logger.exception("Failed to check the reconciliation event timer status")
-        else:
-            if not reconcile_timer_is_active:
-                logger.error("Reconciliation event timer is not activated")
-                self._set_reconcile_timer()
+            manager_service.setup(state, self.app.name, self.unit.name)
+        except RunnerManagerApplicationError:
+            logging.exception("Unable to setup the github-runner-manager service")
+            raise
+        self._manager_client.wait_till_ready()
 
     @staticmethod
     def _log_juju_processes() -> None:
@@ -612,599 +393,35 @@ class GithubRunnerCharm(CharmBase):
         except SubprocessError:
             logger.exception("Failed to get Juju processes")
 
-    @catch_charm_errors
-    def _on_upgrade_charm(self, _: UpgradeCharmEvent) -> None:
-        """Handle the update of charm."""
-        state = self._setup_state()
-
-        logger.info("Reinstalling dependencies...")
-        if not self._common_install_code(state):
-            return
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            # No dependency upgrade needed for openstack.
-            # No need to flush runners as there was no dependency upgrade.
-            return
-
-        runner_manager = self._get_runner_manager(state)
-        logger.info("Flushing the runners...")
-        runner_manager.flush(LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK)
-        self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
-
-    # Temporarily ignore too-complex since this is subject to refactor.
-    @catch_charm_errors
-    def _on_config_changed(self, _: ConfigChangedEvent) -> None:  # noqa: C901
-        """Handle the configuration change."""
-        state = self._setup_state()
-        self._set_reconcile_timer()
-
-        prev_config_for_flush: dict[str, str] = {}
-        should_flush_runners = False
-        if state.charm_config.token != self._stored.token:
-            prev_config_for_flush[TOKEN_CONFIG_NAME] = str(self._stored.token)
-            self._start_services(state.charm_config.token, state.proxy_config)
-            self._stored.token = None
-        if self.config[PATH_CONFIG_NAME] != self._stored.path:
-            prev_config_for_flush[PATH_CONFIG_NAME] = parse_github_path(
-                self._stored.path, self.config[GROUP_CONFIG_NAME]
-            )
-            self._stored.path = self.config[PATH_CONFIG_NAME]
-        if self.config[LABELS_CONFIG_NAME] != self._stored.labels:
-            should_flush_runners = True
-            self._stored.labels = self.config[LABELS_CONFIG_NAME]
-        if prev_config_for_flush or should_flush_runners:
-            if state.instance_type != InstanceType.OPENSTACK:
-                prev_runner_manager = self._get_runner_manager(
-                    state=state, **prev_config_for_flush
-                )
-                if prev_runner_manager:
-                    self.unit.status = MaintenanceStatus("Removing runners due to config change")
-                    # Flush runner in case the prev token has expired.
-                    prev_runner_manager.flush(LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK)
-
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            if not self._get_set_image_ready_status():
-                return
-            if state.charm_config.token != self._stored.token:
-                runner_scaler = self._get_runner_scaler(state)
-                runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
-                self._reconcile_openstack_runners(
-                    runner_scaler, state.runner_config.virtual_machines
-                )
-                # TODO: 2024-04-12: Flush on token changes.
-            return
-
-        self._refresh_firewall(state)
-
-        runner_manager = self._get_runner_manager(state)
-        if state.charm_config.token != self._stored.token:
-            runner_manager.flush(LXDFlushMode.FORCE_FLUSH_WAIT_REPO_CHECK)
-            self._stored.token = state.charm_config.token
-        self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
-        self.unit.status = ActiveStatus()
-
-    def _check_and_update_local_lxd_dependencies(
-        self, runner_manager: LXDRunnerManager, token: str, proxy_config: ProxyConfig
-    ) -> bool:
-        """Check and update runner binary and services for local LXD runners.
-
-        The runners are flushed if needed.
-
-        Args:
-            runner_manager: RunnerManager used for finding the runner application to download.
-            token: GitHub personal access token for repo-policy-compliance to use.
-            proxy_config: Proxy configuration.
-
-        Returns:
-            Whether the runner binary or the services was updated.
-        """
-        self.unit.status = MaintenanceStatus("Checking for updates")
-
-        # Check if the runner binary file exists.
-        if not runner_manager.check_runner_bin():
-            self._stored.runner_bin_url = None
+    def _log_charm_status(self) -> None:
+        """Log information as a substitute for metrics."""
+        juju_charm_path = pathlib.Path(".juju-charm")
+        juju_charm = None
+        # .juju-charm is not part of the public interface of Juju,
+        # and could disappear in a future release.
         try:
-            self.unit.status = MaintenanceStatus("Checking for runner binary updates")
-            runner_info = runner_manager.get_latest_runner_bin_url()
-        except urllib.error.URLError as err:
-            logger.exception("Failed to check for runner updates")
-            # Failure to download runner binary is a transient error.
-            # The charm automatically update runner binary on a schedule.
-            self.unit.status = MaintenanceStatus(f"Failed to check for runner updates: {err}")
-            return False
-
-        logger.debug(
-            "Current runner binary URL: %s, Queried runner binary URL: %s",
-            self._stored.runner_bin_url,
-            runner_info.download_url,
-        )
-        runner_bin_updated = False
-        if runner_info.download_url != self._stored.runner_bin_url:
-            self.unit.status = MaintenanceStatus("Updating runner binary")
-            runner_manager.update_runner_bin(runner_info)
-            self._stored.runner_bin_url = runner_info.download_url
-            runner_bin_updated = True
-
-        self.unit.status = MaintenanceStatus("Checking for service updates")
-        service_updated = self._install_repo_policy_compliance(proxy_config)
-
-        if service_updated or runner_bin_updated:
-            logger.info(
-                "Flushing runner due to: service updated=%s, runner binary update=%s",
-                service_updated,
-                runner_bin_updated,
-            )
-            self.unit.status = MaintenanceStatus("Flushing runners due to updated deps")
-            runner_manager.flush(LXDFlushMode.FLUSH_IDLE_WAIT_REPO_CHECK)
-            self._start_services(token, proxy_config)
-
-        self.unit.status = ActiveStatus()
-        return service_updated or runner_bin_updated
-
-    @catch_charm_errors
-    def _on_reconcile_runners(self, _: ReconcileRunnersEvent) -> None:
-        """Event handler for reconciling runners."""
-        self._trigger_reconciliation()
-
-    @catch_charm_errors
-    def _on_database_created(self, _: ops.RelationEvent) -> None:
-        """Handle the MongoDB database created event."""
-        self._trigger_reconciliation()
-
-    @catch_charm_errors
-    def _on_endpoints_changed(self, _: ops.RelationEvent) -> None:
-        """Handle the MongoDB endpoints changed event."""
-        self._trigger_reconciliation()
-
-    def _trigger_reconciliation(self) -> None:
-        """Trigger the reconciliation of runners."""
-        self.unit.status = MaintenanceStatus("Reconciling runners")
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            if not self._get_set_image_ready_status():
-                return
-            runner_scaler = self._get_runner_scaler(state)
-            self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
-            return
-
-        runner_manager = self._get_runner_manager(state)
-
-        self._check_and_update_local_lxd_dependencies(
-            runner_manager, state.charm_config.token, state.proxy_config
-        )
-
-        runner_info = runner_manager.get_github_info()
-        if all(not info.busy for info in runner_info):
-            self._update_kernel(now=True)
-
-        self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
-
-        self.unit.status = ActiveStatus()
-
-    @catch_action_errors
-    def _on_check_runners_action(self, event: ActionEvent) -> None:
-        """Handle the action of checking of runner state.
-
-        Args:
-            event: The event fired on check_runners action.
-        """
-        online = 0
-        offline = 0
-        unknown = 0
-        runner_names = []
-
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            runner_scaler = self._get_runner_scaler(state)
-            info = runner_scaler.get_runner_info()
-            event.set_results(
-                {
-                    "online": info.online,
-                    "busy": info.busy,
-                    "offline": info.offline,
-                    "unknown": info.unknown,
-                    "runners": info.runners,
-                    "busy-runners": info.busy_runners,
-                }
-            )
-            return
-
-        runner_manager = self._get_runner_manager(state)
-        if runner_manager.runner_bin_path is None:
-            event.fail("Missing runner binary")
-            return
-
-        runner_info = runner_manager.get_github_info()
-        for runner in runner_info:
-            if runner.status == GitHubRunnerStatus.ONLINE.value:
-                online += 1
-                runner_names.append(runner.name)
-            elif runner.status == GitHubRunnerStatus.OFFLINE.value:
-                offline += 1
-            else:
-                # might happen if runner dies and GH doesn't notice immediately
-                unknown += 1
-        event.set_results(
-            {
-                "online": online,
-                "offline": offline,
-                "unknown": unknown,
-                "runners": ", ".join(runner_names),
+            if juju_charm_path.exists():
+                juju_charm = juju_charm_path.read_text(encoding="utf-8").strip()
+            log = {
+                "log_type": "update_state",
+                "juju_charm": juju_charm,
+                "unit_status": self.unit.status.name,
             }
-        )
-
-    @catch_action_errors
-    def _on_reconcile_runners_action(self, event: ActionEvent) -> None:
-        """Handle the action of reconcile of runner state.
-
-        Args:
-            event: Action event of reconciling the runner.
-        """
-        self.unit.status = MaintenanceStatus("Reconciling runners")
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            if not self._get_set_image_ready_status():
-                event.fail("Openstack image not yet provided/ready.")
-                return
-            runner_scaler = self._get_runner_scaler(state)
-
-            self.unit.status = MaintenanceStatus("Reconciling runners")
-            try:
-                delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
-            except ReconcileError:
-                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
-                self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
-                event.fail(FAILED_RECONCILE_ACTION_ERR_MSG)
-                return
-
-            self.unit.status = ActiveStatus()
-            event.set_results({"delta": {"virtual-machines": delta}})
-            return
-
-        runner_manager = self._get_runner_manager(state)
-
-        self._check_and_update_local_lxd_dependencies(
-            runner_manager, state.charm_config.token, state.proxy_config
-        )
-
-        delta = self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
-        self.unit.status = ActiveStatus()
-        self._on_check_runners_action(event)
-        event.set_results(delta)
-
-    @catch_action_errors
-    def _on_flush_runners_action(self, event: ActionEvent) -> None:
-        """Handle the action of flushing all runner and reconciling afterwards.
-
-        Args:
-            event: Action event of flushing all runners.
-        """
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            # Flushing mode not implemented for OpenStack yet.
-            runner_scaler = self._get_runner_scaler(state)
-            flushed = runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
-            logger.info("Flushed %s runners", flushed)
-            self.unit.status = MaintenanceStatus("Reconciling runners")
-            try:
-                delta = runner_scaler.reconcile(state.runner_config.virtual_machines)
-            except ReconcileError:
-                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
-                self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
-                event.fail(FAILED_RECONCILE_ACTION_ERR_MSG)
-                return
-            self.unit.status = ActiveStatus()
-            event.set_results({"delta": {"virtual-machines": delta}})
-            return
-
-        runner_manager = self._get_runner_manager(state)
-
-        runner_manager.flush(LXDFlushMode.FLUSH_BUSY_WAIT_REPO_CHECK)
-        delta = self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
-        event.set_results({"delta": {"virtual-machines": delta}})
-
-    @catch_action_errors
-    def _on_update_dependencies_action(self, event: ActionEvent) -> None:
-        """Handle the action of updating dependencies and flushing runners if needed.
-
-        Args:
-            event: Action event of updating dependencies.
-        """
-        state = self._setup_state()
-        if state.instance_type == InstanceType.OPENSTACK:
-            # No dependencies managed by the charm for OpenStack-based runners.
-            event.set_results({"flush": False})
-            return
-
-        runner_manager = self._get_runner_manager(state)
-        flushed = self._check_and_update_local_lxd_dependencies(
-            runner_manager, state.charm_config.token, state.proxy_config
-        )
-        event.set_results({"flush": flushed})
-
-    @catch_charm_errors
-    def _on_update_status(self, _: UpdateStatusEvent) -> None:
-        """Handle the update of charm status."""
-        self._ensure_reconcile_timer_is_active()
-        self._log_juju_processes()
+            logstr = json.dumps(log)
+            logger.info(logstr)
+        except (AttributeError, TypeError, ValueError):
+            logger.exception("Error preparing log metrics")
 
     @catch_charm_errors
     def _on_stop(self, _: StopEvent) -> None:
         """Handle the stopping of the charm."""
-        self._event_timer.disable_event_timer("reconcile-runners")
-        state = self._setup_state()
-
-        if state.instance_type == InstanceType.OPENSTACK:
-            runner_scaler = self._get_runner_scaler(state)
-            runner_scaler.flush(FlushMode.FLUSH_BUSY)
-            return
-
-        runner_manager = self._get_runner_manager(state)
-        runner_manager.flush(LXDFlushMode.FLUSH_BUSY)
-
-    def _reconcile_lxd_runners(
-        self, runner_manager: LXDRunnerManager, num: int, resources: VirtualMachineResources
-    ) -> Dict[str, Any]:
-        """Reconcile the current runners state and intended runner state for LXD mode.
-
-        Args:
-            runner_manager: For querying and managing the runner state.
-            num: Target number of virtual machines.
-            resources: Target resource for each virtual machine.
-
-        Raises:
-            MissingRunnerBinaryError: If the runner binary is not found.
-
-        Returns:
-            Changes in runner number due to reconciling runners.
-        """
-        if not LXDRunnerManager.runner_bin_path.is_file():
-            logger.warning("Unable to reconcile due to missing runner binary")
-            raise MissingRunnerBinaryError("Runner binary not found.")
-
-        self.unit.status = MaintenanceStatus("Reconciling runners")
-        delta_virtual_machines = runner_manager.reconcile(
-            num,
-            resources,
-        )
-
-        self.unit.status = ActiveStatus()
-        return {"delta": {"virtual-machines": delta_virtual_machines}}
-
-    def _reconcile_openstack_runners(self, runner_scaler: RunnerScaler, num: int) -> None:
-        """Reconcile the current runners state and intended runner state for OpenStack mode.
-
-        Args:
-            runner_scaler: Scaler used to scale the amount of runners.
-            num: Target number of runners.
-        """
-        self.unit.status = MaintenanceStatus("Reconciling runners")
-        try:
-            runner_scaler.reconcile(num)
-        except ReconcileError:
-            logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
-            self.unit.status = ActiveStatus(ACTIVE_STATUS_RECONCILIATION_FAILED_MSG)
-        else:
-            self.unit.status = ActiveStatus()
-
-    def _install_repo_policy_compliance(self, proxy_config: ProxyConfig) -> bool:
-        """Install latest version of repo_policy_compliance service.
-
-        Args:
-            proxy_config: Proxy configuration.
-
-        Returns:
-            Whether version install is changed. Going from not installed to
-            installed will return True.
-        """
-        # Prepare environment variables for pip subprocess
-        env = {}
-        if http_proxy := proxy_config.http:
-            env["HTTP_PROXY"] = http_proxy
-            env["http_proxy"] = http_proxy
-        if https_proxy := proxy_config.https:
-            env["HTTPS_PROXY"] = https_proxy
-            env["https_proxy"] = https_proxy
-        if no_proxy := proxy_config.no_proxy:
-            env["NO_PROXY"] = no_proxy
-            env["no_proxy"] = no_proxy
-
-        old_version = execute_command(
-            [
-                "/usr/bin/python3",
-                "-m",
-                "pip",
-                "show",
-                "repo-policy-compliance",
-            ],
-            check_exit=False,
-        )
-
-        execute_command(
-            [
-                "/usr/bin/python3",
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "git+https://github.com/canonical/repo-policy-compliance@main",
-            ],
-            env=env,
-        )
-
-        new_version = execute_command(
-            [
-                "/usr/bin/python3",
-                "-m",
-                "pip",
-                "show",
-                "repo-policy-compliance",
-            ],
-            check_exit=False,
-        )
-        return old_version != new_version
-
-    def _enable_kernel_modules(self) -> None:
-        """Enable kernel modules needed by the charm."""
-        execute_command(["/usr/sbin/modprobe", "br_netfilter"])
-        with self.kernel_module_path.open("a", encoding="utf-8") as modules_file:
-            modules_file.write("br_netfilter\n")
+        self._manager_client.flush_runner(busy=True)
+        manager_service.stop()
 
     def _install_deps(self) -> None:
         """Install dependences for the charm."""
         logger.info("Installing charm dependencies.")
-        self._apt_install(["run-one"])
-
-    @retry(tries=5, delay=5, max_delay=60, backoff=2, local_logger=logger)
-    def _install_local_lxd_deps(self) -> None:
-        """Install dependencies for running local LXD runners."""
-        state = self._setup_state()
-
-        logger.info("Installing local LXD runner dependencies.")
-        # Snap and Apt will use any proxies configured in the Juju model.
-        # Binding for snap, apt, and lxd init commands are not available so subprocess.run used.
-        # Install dependencies used by repo-policy-compliance and the firewall
-        self._apt_install(["gunicorn", "python3-pip", "nftables"])
-        # Install repo-policy-compliance package
-        self._install_repo_policy_compliance(state.proxy_config)
-        execute_command(
-            ["/usr/bin/apt-get", "remove", "-qy", "lxd", "lxd-client"], check_exit=False
-        )
-        self._apt_install(
-            [
-                "cpu-checker",
-                "libvirt-clients",
-                "libvirt-daemon-driver-qemu",
-                "apparmor-utils",
-            ],
-        )
-        execute_command(["/usr/bin/snap", "install", "lxd", "--channel=latest/stable"])
-        execute_command(["/usr/bin/snap", "refresh", "lxd", "--channel=latest/stable"])
-        # Add ubuntu user to lxd group, to allow building images with ubuntu user
-        execute_command(["/usr/sbin/usermod", "-aG", "lxd", "ubuntu"])
-        execute_command(["/snap/bin/lxd", "waitready"])
-        execute_command(["/snap/bin/lxd", "init", "--auto"])
-        execute_command(["/snap/bin/lxc", "network", "set", "lxdbr0", "ipv6.address", "none"])
-        execute_command(["/snap/bin/lxd", "waitready"])
-        if not LXD_PROFILE_YAML.exists():
-            self._enable_kernel_modules()
-        execute_command(
-            [
-                "/snap/bin/lxc",
-                "profile",
-                "device",
-                "set",
-                "default",
-                "eth0",
-                "security.ipv4_filtering=true",
-                "security.ipv6_filtering=true",
-                "security.mac_filtering=true",
-                "security.port_isolation=true",
-            ]
-        )
-        logger.info("Finished installing local LXD runner dependencies.")
-
-    @retry(tries=5, delay=5, max_delay=60, backoff=2, local_logger=logger)
-    def _start_services(self, token: str, proxy_config: ProxyConfig) -> None:
-        """Ensure all services managed by the charm is running.
-
-        Args:
-            token: GitHub personal access token for repo-policy-compliance to use.
-            proxy_config: Proxy configuration.
-        """
-        logger.info("Starting charm services...")
-
-        if self.service_token is None:
-            self.service_token = self._get_service_token()
-
-        # Move script to home directory
-        logger.info("Loading the repo policy compliance flask app...")
-        os.makedirs(self.repo_check_web_service_path, exist_ok=True)
-        shutil.copyfile(
-            self.repo_check_web_service_script,
-            self.repo_check_web_service_path / "app.py",
-        )
-
-        # Move the systemd service.
-        logger.info("Loading the repo policy compliance gunicorn systemd service...")
-        environment = jinja2.Environment(
-            loader=jinja2.FileSystemLoader("templates"), autoescape=True
-        )
-
-        service_content = environment.get_template("repo-policy-compliance.service.j2").render(
-            working_directory=str(self.repo_check_web_service_path),
-            charm_token=self.service_token,
-            github_token=token,
-            proxies=proxy_config,
-        )
-        self.repo_check_systemd_service.write_text(service_content, encoding="utf-8")
-
-        execute_command(["/usr/bin/systemctl", "daemon-reload"])
-        execute_command(["/usr/bin/systemctl", "restart", "repo-policy-compliance"])
-        execute_command(["/usr/bin/systemctl", "enable", "repo-policy-compliance"])
-
-        logger.info("Finished starting charm services")
-
-    def _get_service_token(self) -> str:
-        """Get the service token.
-
-        Returns:
-            The service token.
-        """
-        logger.info("Getting the secret token...")
-        if self.service_token_path.exists():
-            logger.info("Found existing token file.")
-            service_token = self.service_token_path.read_text(encoding="utf-8")
-        else:
-            logger.info("Generate new token.")
-            service_token = secrets.token_hex(16)
-            self.service_token_path.write_text(service_token, encoding="utf-8")
-        return service_token
-
-    def _refresh_firewall(self, state: CharmState) -> None:
-        """Refresh the firewall configuration and rules.
-
-        Args:
-            state: Charm state.
-        """
-        # Temp: Monitor the LXD networks to track down issues with missing network.
-        logger.info(execute_command(["/snap/bin/lxc", "network", "list", "--format", "json"]))
-
-        allowlist = [
-            FirewallEntry.decode(str(entry.host)) for entry in state.ssh_debug_connections
-        ]
-        firewall = Firewall("lxdbr0")
-        firewall.refresh_firewall(denylist=state.charm_config.denylist, allowlist=allowlist)
-        logger.debug(
-            "firewall update, current firewall: %s",
-            execute_command(["/usr/sbin/nft", "list", "ruleset"]),
-        )
+        self._apt_install(["run-one", "python3-pip", "python3-venv"])
 
     def _apt_install(self, packages: Sequence[str]) -> None:
         """Execute apt install command.
@@ -1225,38 +442,19 @@ class GithubRunnerCharm(CharmBase):
     @catch_charm_errors
     def _on_debug_ssh_relation_changed(self, _: ops.RelationChangedEvent) -> None:
         """Handle debug ssh relation changed event."""
+        self.unit.status = MaintenanceStatus("Added debug-ssh relation")
+        self._check_image_ready()
+
         state = self._setup_state()
+        self._setup_service(state)
 
-        if state.instance_type == InstanceType.OPENSTACK:
-            if not self._get_set_image_ready_status():
-                return
-            runner_scaler = self._get_runner_scaler(state)
-            runner_scaler.flush()
-            try:
-                runner_scaler.reconcile(state.runner_config.virtual_machines)
-            except ReconcileError:
-                logger.exception(FAILED_TO_RECONCILE_RUNNERS_MSG)
-            return
-
-        self._refresh_firewall(state)
-        runner_manager = self._get_runner_manager(state)
-        runner_manager.flush(LXDFlushMode.FLUSH_IDLE)
-        self._reconcile_lxd_runners(
-            runner_manager,
-            state.runner_config.virtual_machines,
-            state.runner_config.virtual_machine_resources,
-        )
+        self._manager_client.flush_runner()
+        self.unit.status = ActiveStatus()
 
     @catch_charm_errors
     def _on_image_relation_joined(self, _: ops.RelationJoinedEvent) -> None:
         """Handle image relation joined event."""
         state = self._setup_state()
-
-        if state.instance_type != InstanceType.OPENSTACK:
-            self.unit.status = BlockedStatus(
-                "Openstack mode not enabled. Please remove the image integration."
-            )
-            return
 
         clouds_yaml = state.charm_config.openstack_clouds_yaml
         cloud = list(clouds_yaml["clouds"].keys())[0]
@@ -1267,87 +465,45 @@ class GithubRunnerCharm(CharmBase):
     @catch_charm_errors
     def _on_image_relation_changed(self, _: ops.RelationChangedEvent) -> None:
         """Handle image relation changed event."""
-        state = self._setup_state()
         self.unit.status = MaintenanceStatus("Update image for runners")
+        self._check_image_ready()
 
-        if state.instance_type != InstanceType.OPENSTACK:
-            self.unit.status = BlockedStatus(
-                "Openstack mode not enabled. Please remove the image integration."
-            )
-            return
-        if not self._get_set_image_ready_status():
-            return
+        state = self._setup_state()
+        self._setup_service(state)
 
-        runner_scaler = self._get_runner_scaler(state)
-        runner_scaler.flush(flush_mode=FlushMode.FLUSH_IDLE)
-        self._reconcile_openstack_runners(runner_scaler, state.runner_config.virtual_machines)
+        self._manager_client.flush_runner()
+        self.unit.status = ActiveStatus()
 
-    def _get_set_image_ready_status(self) -> bool:
-        """Check if image is ready for Openstack and charm status accordingly.
+    @catch_charm_errors
+    def _on_database_created(self, _: ops.RelationEvent) -> None:
+        """Handle the MongoDB database created event."""
+        state = self._setup_state()
+        self._setup_service(state)
 
-        Returns:
-            Whether the Openstack image is ready via image integration.
+    @catch_charm_errors
+    def _on_endpoints_changed(self, _: ops.RelationEvent) -> None:
+        """Handle the MongoDB endpoints changed event."""
+        state = self._setup_state()
+        self._setup_service(state)
+
+    @catch_charm_errors
+    def _on_mongodb_relation_broken(self, _: ops.RelationDepartedEvent) -> None:
+        """Handle the MongoDB relation broken event."""
+        state = self._setup_state()
+        self._setup_service(state)
+
+    def _check_image_ready(self) -> None:
+        """Check if image is ready raises error if not.
+
+        Raises:
+            ImageIntegrationMissingError: No image integration found.
+            ImageNotFoundError: No image found in the image integration.
         """
         openstack_image = OpenstackImage.from_charm(self)
         if openstack_image is None:
-            self.unit.status = BlockedStatus("Please provide image integration.")
-            return False
+            raise ImageIntegrationMissingError("No image integration found")
         if not openstack_image.id:
-            self.unit.status = WaitingStatus("Waiting for image over integration.")
-            return False
-        return True
-
-    def _get_runner_scaler(
-        self, state: CharmState, token: str | None = None, path: GitHubPath | None = None
-    ) -> RunnerScaler:
-        """Get runner scaler instance for scaling runners.
-
-        Args:
-            state: Charm state.
-            token: GitHub personal access token to manage the runners with. If None the token in
-                charm state is used.
-            path: GitHub repository path in the format '<org>/<repo>', or the GitHub organization
-                name. If None the path in charm state is used.
-
-        Returns:
-            An instance of RunnerScaler.
-        """
-        if token is None:
-            token = state.charm_config.token
-        if path is None:
-            path = state.charm_config.path
-
-        openstack_runner_manager_config = self._create_openstack_runner_manager_config(path, state)
-        openstack_runner_manager = OpenStackRunnerManager(
-            config=openstack_runner_manager_config,
-        )
-        runner_manager_config = RunnerManagerConfig(
-            name=self.app.name,
-            token=token,
-            path=path,
-        )
-        runner_manager = RunnerManager(
-            cloud_runner_manager=openstack_runner_manager,
-            config=runner_manager_config,
-        )
-        reactive_runner_config = None
-        if reactive_config := state.reactive_config:
-            # The charm is not able to determine which architecture the runner is running on,
-            # so we add all architectures to the supported labels.
-            supported_labels = set(self._create_labels(state)) | GITHUB_SELF_HOSTED_ARCH_LABELS
-            reactive_runner_config = ReactiveRunnerConfig(
-                queue=ReactiveQueueConfig(
-                    mongodb_uri=reactive_config.mq_uri, queue_name=self.app.name
-                ),
-                runner_manager=runner_manager_config,
-                cloud_runner_manager=openstack_runner_manager_config,
-                github_token=token,
-                supported_labels=supported_labels,
-                system_user=SystemUserConfig(user=RUNNER_MANAGER_USER, group=RUNNER_MANAGER_GROUP),
-            )
-        return RunnerScaler(
-            runner_manager=runner_manager, reactive_runner_config=reactive_runner_config
-        )
+            raise ImageNotFoundError("No image found in the image integration")
 
     @staticmethod
     def _create_labels(state: CharmState) -> list[str]:
@@ -1366,90 +522,74 @@ class GithubRunnerCharm(CharmBase):
 
         return list(state.charm_config.labels) + image_labels
 
-    def _create_openstack_runner_manager_config(
-        self, path: GitHubPath, state: CharmState
-    ) -> OpenStackRunnerManagerConfig:
-        """Create OpenStackRunnerManagerConfig instance.
-
-        Args:
-            path: GitHub repository path in the format '<org>/<repo>', or the GitHub organization
-                name.
-            state: Charm state.
-
-        Returns:
-            An instance of OpenStackRunnerManagerConfig.
-        """
-        clouds = list(state.charm_config.openstack_clouds_yaml["clouds"].keys())
-        if len(clouds) > 1:
-            logger.warning(
-                "Multiple clouds defined in clouds.yaml. Using the first one to connect."
-            )
-        first_cloud_config = state.charm_config.openstack_clouds_yaml["clouds"][clouds[0]]
-        credentials = OpenStackCredentials(
-            auth_url=first_cloud_config["auth"]["auth_url"],
-            project_name=first_cloud_config["auth"]["project_name"],
-            username=first_cloud_config["auth"]["username"],
-            password=first_cloud_config["auth"]["password"],
-            user_domain_name=first_cloud_config["auth"]["user_domain_name"],
-            project_domain_name=first_cloud_config["auth"]["project_domain_name"],
-            region_name=first_cloud_config["region_name"],
-        )
-        server_config = None
-        image = state.runner_config.openstack_image
-        if image and image.id:
-            server_config = OpenStackServerConfig(
-                image=image.id,
-                flavor=state.runner_config.openstack_flavor,
-                network=state.runner_config.openstack_network,
-            )
-        labels = self._create_labels(state)
-        runner_config = GitHubRunnerConfig(github_path=path, labels=labels)
-        service_config = SupportServiceConfig(
-            proxy_config=state.proxy_config,
-            dockerhub_mirror=state.charm_config.dockerhub_mirror,
-            ssh_debug_connections=state.ssh_debug_connections,
-            repo_policy_compliance=state.charm_config.repo_policy_compliance,
-        )
-        openstack_runner_manager_config = OpenStackRunnerManagerConfig(
-            name=self.app.name,
-            # The prefix is set to f"{application_name}-{unit number}"
-            prefix=self.unit.name.replace("/", "-"),
-            credentials=credentials,
-            server_config=server_config,
-            runner_config=runner_config,
-            service_config=service_config,
-            system_user_config=SystemUserConfig(
-                user=RUNNER_MANAGER_USER, group=RUNNER_MANAGER_GROUP
-            ),
-        )
-        return openstack_runner_manager_config
-
 
 def _setup_runner_manager_user() -> None:
     """Create the user and required directories for the runner manager."""
     # check if runner_manager user is already existing
-    _, retcode = execute_command(["/usr/bin/id", RUNNER_MANAGER_USER], check_exit=False)
+    _, retcode = execute_command(["/usr/bin/id", constants.RUNNER_MANAGER_USER], check_exit=False)
     if retcode != 0:
-        logger.info("Creating user %s", RUNNER_MANAGER_USER)
+        logger.info("Creating user %s", constants.RUNNER_MANAGER_USER)
         execute_command(
             [
                 "/usr/sbin/useradd",
                 "--system",
                 "--create-home",
                 "--user-group",
-                RUNNER_MANAGER_USER,
+                constants.RUNNER_MANAGER_USER,
             ],
         )
-    execute_command(["/usr/bin/mkdir", "-p", f"/home/{RUNNER_MANAGER_USER}/.ssh"])
+    execute_command(["/usr/bin/mkdir", "-p", f"/home/{constants.RUNNER_MANAGER_USER}/.ssh"])
     execute_command(
         [
             "/usr/bin/chown",
             "-R",
-            f"{RUNNER_MANAGER_USER}:{RUNNER_MANAGER_USER}",
-            f"/home/{RUNNER_MANAGER_USER}/.ssh",
+            f"{constants.RUNNER_MANAGER_USER}:{constants.RUNNER_MANAGER_USER}",
+            f"/home/{constants.RUNNER_MANAGER_USER}/.ssh",
         ]
     )
-    execute_command(["/usr/bin/chmod", "700", f"/home/{RUNNER_MANAGER_USER}/.ssh"])
+    execute_command(["/usr/bin/chmod", "700", f"/home/{constants.RUNNER_MANAGER_USER}/.ssh"])
+    # Give the user access to write to /var/log
+    execute_command(["/usr/sbin/usermod", "-a", "-G", "syslog", constants.RUNNER_MANAGER_USER])
+    execute_command(["/usr/bin/chmod", "g+w", "/var/log"])
+
+    # For charm upgrade, previous revision root owns the metric logs, this is changed to runner
+    # manager.
+    if METRICS_LOG_PATH.exists():
+        shutil.chown(
+            METRICS_LOG_PATH,
+            user=constants.RUNNER_MANAGER_USER,
+            group=constants.RUNNER_MANAGER_GROUP,
+        )
+
+
+def _disable_legacy_service() -> None:
+    """Disable any legacy service."""
+    logger.info("Attempting to stop legacy services")
+    try:
+        systemd.service_disable(LEGACY_RECONCILE_TIMER_SERVICE)
+        systemd.service_stop(LEGACY_RECONCILE_TIMER_SERVICE)
+    except systemd.SystemdError:
+        pass
+    try:
+        systemd.service_disable(LEGACY_RECONCILE_SERVICE)
+        systemd.service_stop(LEGACY_RECONCILE_SERVICE)
+    except systemd.SystemdError:
+        pass
+
+    try:
+        timer_path = pathlib.Path("/etc/systemd/system") / LEGACY_RECONCILE_TIMER_SERVICE
+        service_path = pathlib.Path("/etc/systemd/system") / LEGACY_RECONCILE_SERVICE
+        timer_path.unlink(missing_ok=True)
+        service_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Unexpected exception during removal of legacy systemd service files", exc_info=True
+        )
+
+    try:
+        systemd.daemon_reload()
+    except systemd.SystemdError:
+        logger.warning("Unable to reload systemd daemon", exc_info=True)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from juju.model import Model
 from pytest_operator.plugin import OpsTest
 
 from charm_state import (
+    BASE_VIRTUAL_MACHINES_CONFIG_NAME,
     OPENSTACK_CLOUDS_YAML_CONFIG_NAME,
     OPENSTACK_FLAVOR_CONFIG_NAME,
     OPENSTACK_NETWORK_CONFIG_NAME,
@@ -33,7 +34,6 @@ async def test_charm_upgrade(
     model: Model,
     ops_test: OpsTest,
     charm_file: str,
-    loop_device: str | None,
     app_name: str,
     path: str,
     token: str,
@@ -52,8 +52,8 @@ async def test_charm_upgrade(
     assert: the charm is upgraded successfully.
     """
     latest_stable_path = tmp_path / "github-runner.charm"
-    latest_stable_revision = 302  # update this value every release to stable.
-    # download the charm and inject lxd profile for testing
+    latest_stable_revision = 354  # update this value every release to stable.
+    # download the charm
     retcode, stdout, stderr = await ops_test.juju(
         "download",
         "github-runner",
@@ -76,7 +76,6 @@ async def test_charm_upgrade(
         app_name=app_name,
         path=path,
         token=token,
-        runner_storage="juju-storage",
         http_proxy=openstack_http_proxy,
         https_proxy=openstack_https_proxy,
         no_proxy=openstack_no_proxy,
@@ -87,17 +86,17 @@ async def test_charm_upgrade(
             OPENSTACK_NETWORK_CONFIG_NAME: network_name,
             OPENSTACK_FLAVOR_CONFIG_NAME: flavor_name,
             USE_APROXY_CONFIG_NAME: "true",
-            VIRTUAL_MACHINES_CONFIG_NAME: 1,
+            VIRTUAL_MACHINES_CONFIG_NAME: 0,
+            BASE_VIRTUAL_MACHINES_CONFIG_NAME: 1,
         },
         wait_idle=False,
-        use_local_lxd=False,
     )
     await model.integrate(f"{image_builder.name}:image", f"{application.name}:image")
     await model.wait_for_idle(
-        apps=[application.name],
+        apps=[application.name, image_builder.name],
         raise_on_error=False,
         wait_for_active=True,
-        timeout=180 * 60,
+        timeout=25 * 60,
         check_freq=30,
     )
     origin = client.CharmOrigin(
@@ -128,6 +127,6 @@ async def test_charm_upgrade(
         apps=[application.name],
         raise_on_error=False,
         wait_for_active=True,
-        timeout=180 * 60,
+        timeout=20 * 60,
         check_freq=30,
     )

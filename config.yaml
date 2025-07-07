@@ -2,20 +2,6 @@
 # See LICENSE file for licensing details.
 
 options:
-  base-image:
-    type: string
-    default: "jammy"
-    description: >-
-      The base ubuntu OS image to use for the runners. Codename (e.g. "jammy") or version tag
-      (e.g. 22.04) is supported as input. Currently only supports LTS versions of jammy and higher,
-      i.e. jammy, noble. Only applicable for LXD mode.
-  denylist:
-    type: string
-    default: ""
-    description: >-
-      A comma separated list of IPv4 networks in CIDR notation that runners can not access.
-      The runner will always have access to essential services such as DHCP and DNS regardless
-      of the denylist configuration.
   dockerhub-mirror:
     type: string
     default: ""
@@ -27,14 +13,14 @@ options:
     type: string
     default: ""
     description: >-
-      Providing a valid clouds.yaml will enable OpenStack integration. Setting the
-      openstack-clouds-yaml would enable spawning runners on OpenStack, and disable usage of
-      local LXD for runners. The format for the clouds.yaml is described in the docs:
+      The clouds.yaml yaml necessary for OpenStack integration.
+      The format for the clouds.yaml is described in the docs:
       (https://docs.openstack.org/python-openstackclient/pike/configuration/index.html#clouds-yaml).
   openstack-flavor:
     type: string
     default: ""
     description: |
+      (Deprecated, use flavor-label-list instead)
       The openstack flavor to use to spawn virtual machines. This controls the hardware resource
       of the virtual machines. See docs for details:
       (https://docs.openstack.org/nova/rocky/user/flavors.html).
@@ -52,7 +38,7 @@ options:
     description: >-
       (Experimental, may be removed) When set to true, aproxy (https://github.com/canonical/aproxy)
       will be installed within the runners. It will forward all HTTP(S) traffic to standard ports
-      (80, 443) to a proxy server configured by the juju model config 'juju-http-proxy'
+      (80, 443, 11371) to a proxy server configured by the juju model config 'juju-http-proxy'
       (or, if this is not set, 'juju-https-proxy' will be used).
       This is useful when the charm is deployed in a network that requires a proxy to access the
       internet.
@@ -81,13 +67,11 @@ options:
       "{owner}/{repo}" format.
   reconcile-interval:
     type: int
-    default: 10
+    default: 5
     description: >-
       Minutes between each reconciliation of the current runners state and their targeted state.
-      On reconciliation, the charm polls the state of runners and see if actions are needed. A
-      random delay of 25% is added. Changes to this time interval will apply when next interval is
-      triggered. Prior to reconciliation, any packages, and services used by the software will be
-      updated.
+      On reconciliation, the charm polls the state of runners and see if actions are needed. The
+      value should be kept low, unless Github API rate limiting is encountered.
   repo-policy-compliance-token:
     type: string
     description: >-
@@ -100,15 +84,6 @@ options:
       The URL to the repository-policy-compliance service. This option requires the
       repo-policy-compliance-token to be set. If not set, the repository-policy-compliance service
       will not be used. This option is only supported when using OpenStack Cloud.
-  runner-storage:
-    type: string
-    default: "juju-storage"
-    description: >-
-      The storage for runner LXD instance to mount as disk. Can be "memory" or "juju-storage". If
-      set to "memory", memory-based storage created with tmpfs will be used as disk for LXD
-      instances. If set to "juju-storage", storage provided by juju will be used as disk for LXD
-      instances. This configuration cannot be changed after deployment. The charm needs to be
-      redeployed to change the storage option.
   test-mode:
     type: string
     description: >-
@@ -124,24 +99,67 @@ options:
       https://charmhub.io/github-runner/docs/how-to-change-token.
   virtual-machines:
     type: int
-    default: 1
+    default: 0
     description: >-
+      (Deprecated, use base-virtual-machines or max-total-virtual-machines instead)
       The number of virtual machine runners. This charm will spawn or destroy virtual machines
-      runners to match this setting.
-  vm-cpu:
+      runners to match this setting. Setting virtual-machines to non-zero and any of
+      base-virtual-machines or max-total-virtual-machines will block the charm.
+  base-virtual-machines:
     type: int
-    default: 2
+    default: 0
     description: >-
-      The number of CPUs used per virtual machine runner.
-  vm-memory:
+      The number of non-reactive virtual machine runners spawned by the charm per each
+      combination of flavor and base. Currently, if the charm is integrated with MongoDB
+      this config option will be ignored.
+  max-total-virtual-machines:
+    type: int
+    default: 0
+    description: >-
+      If the github-runner charm is integrated with MongoDB, the reactive mode will not spawn
+      new virtual machines if there are max-total-virtual-machines of more virtual machines
+      managed by the charm.
+  flavor-label-combinations:
     type: string
-    default: 7GiB
+    default: ""
     description: >-
-      Amount of memory to allocate per virtual machine runner. Positive integers with KiB, MiB, GiB,
-      TiB, PiB, EiB suffix.
-  vm-disk:
+      List of "flavor:label" entries separated by ",". The flavor will correspond to a OpenStack
+      flavor and the label will be a label for the GitHub runner. Only one flavor-label combination
+      is supported at the moment. A valid configuration looks like "m1.small:small".
+  manager-ssh-proxy-command:
     type: string
-    default: 10GiB
+    default: ""
     description: >-
-      Amount of disk space to allocate to root disk for virtual machine runner. Positive integers
-      with KiB, MiB, GiB, TiB, PiB, EiB suffix.
+      Optional ProxyCommand used by the ssh connection which is used to access the virtual
+      machine runners from the runner manager. It is equivalent to ProxyCommand in ssh-config,
+      but without a shell. For example, a value could be something like:
+      `bash -c "openssl s_client -quiet -connect 192.168.20.2:2222 -servername %h 2> /dev/null"`
+  pre-job-script:
+    type: string
+    description: >-
+      Optional script (needs shebang) to execute in the pre-job phase of a spawned runner VM. 
+      This can e.g. be useful for specific infrastructure related configurations 
+      (e.g. usage of certain proxies or custom routes).
+      Note that the user executing the script is the ubuntu user (which has sudo rights).
+      Example script:
+      #!/usr/bin/env bash
+      cat > ~/.ssh/config <<EOF
+      host github.com
+          user git
+          hostname github.com
+          port 22
+          proxycommand socat - PROXY:squid.internal:%h:%p,proxyport=3128
+      EOF
+
+  runner-http-proxy:
+    type: string
+    default: ""
+    description: >-
+      The HTTP proxy value to use for the runners. If not specified, the model configuration option
+      juju-http-proxy will be used instead.
+  use-runner-proxy-for-tmate:
+    type: boolean
+    default: false
+    description: >-
+      When set to true, the ssh connection from the runner to the tmate-ssh-server will be done
+      using the proxy for the runner.

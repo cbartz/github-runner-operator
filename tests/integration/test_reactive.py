@@ -3,22 +3,18 @@
 
 """Testing reactive mode. This is only supported for the OpenStack cloud."""
 import json
-import re
+from asyncio import sleep
 from typing import AsyncIterator
 
 import pytest
 import pytest_asyncio
 from github import Branch, Repository
-from github.WorkflowRun import WorkflowRun
-from github_runner_manager.metrics.runner import PostJobStatus
+from github_runner_manager.manager.cloud_runner_manager import PostJobStatus
 from github_runner_manager.reactive.consumer import JobDetails
 from juju.application import Application
-from juju.model import Model
-from juju.unit import Unit
-from kombu import Connection
 from pytest_operator.plugin import OpsTest
 
-from charm_state import VIRTUAL_MACHINES_CONFIG_NAME
+from charm_state import BASE_VIRTUAL_MACHINES_CONFIG_NAME, MAX_TOTAL_VIRTUAL_MACHINES_CONFIG_NAME
 from tests.integration.helpers.charm_metrics import (
     assert_events_after_reconciliation,
     clear_metrics_log,
@@ -28,10 +24,19 @@ from tests.integration.helpers.common import (
     DISPATCH_CRASH_TEST_WORKFLOW_FILENAME,
     DISPATCH_TEST_WORKFLOW_FILENAME,
     dispatch_workflow,
-    reconcile,
     wait_for,
     wait_for_completion,
+    wait_for_reconcile,
     wait_for_status,
+)
+from tests.integration.utils_reactive import (
+    add_to_queue,
+    assert_queue_has_size,
+    assert_queue_is_empty,
+    clear_queue,
+    create_job_details,
+    get_mongodb_uri,
+    get_queue_size,
 )
 
 pytestmark = pytest.mark.openstack
@@ -42,21 +47,27 @@ async def app_fixture(
     ops_test: OpsTest, app_for_reactive: Application
 ) -> AsyncIterator[Application]:
     """Setup the reactive charm with 1 virtual machine and tear down afterwards."""
-    mongodb_uri = await _get_mongodb_uri(ops_test, app_for_reactive)
-    _clear_queue(mongodb_uri, app_for_reactive.name)
-    _assert_queue_is_empty(mongodb_uri, app_for_reactive.name)
+    mongodb_uri = await get_mongodb_uri(ops_test, app_for_reactive)
+    clear_queue(mongodb_uri, app_for_reactive.name)
+    assert_queue_is_empty(mongodb_uri, app_for_reactive.name)
 
-    await app_for_reactive.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "1"})
-    await reconcile(app_for_reactive, app_for_reactive.model)
+    await app_for_reactive.set_config(
+        {
+            BASE_VIRTUAL_MACHINES_CONFIG_NAME: "0",
+            MAX_TOTAL_VIRTUAL_MACHINES_CONFIG_NAME: "1",
+        }
+    )
+    await wait_for_reconcile(app_for_reactive)
     await clear_metrics_log(app_for_reactive.units[0])
 
     yield app_for_reactive
 
     # Call reconcile to enable cleanup of any runner spawned
-    await app_for_reactive.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "0"})
-    await reconcile(app_for_reactive, app_for_reactive.model)
+    await app_for_reactive.set_config({MAX_TOTAL_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
+    await wait_for_reconcile(app_for_reactive)
 
 
+@pytest.mark.abort_on_fail
 async def test_reactive_mode_spawns_runner(
     ops_test: OpsTest,
     app: Application,
@@ -69,7 +80,7 @@ async def test_reactive_mode_spawns_runner(
     assert: A runner is spawned to process the job and the message is removed from the queue.
         The metrics are logged.
     """
-    mongodb_uri = await _get_mongodb_uri(ops_test, app)
+    mongodb_uri = await get_mongodb_uri(ops_test, app)
 
     run = await dispatch_workflow(
         app=app,
@@ -81,8 +92,8 @@ async def test_reactive_mode_spawns_runner(
     )
     labels = {app.name, "x64"}  # The architecture label should be ignored in the
     # label validation in the reactive consumer.
-    job = _create_job_details(run=run, labels=labels)
-    _add_to_queue(
+    job = create_job_details(run=run, labels=labels)
+    add_to_queue(
         json.dumps(json.loads(job.json()) | {"ignored_noise": "foobar"}),
         mongodb_uri,
         app.name,
@@ -90,7 +101,10 @@ async def test_reactive_mode_spawns_runner(
 
     # This reconcile call is to check that we are not killing machines that are under
     # construction in a subsequent reconciliation.
-    await reconcile(app, app.model)
+
+    # There may be a race condition between getting the token and spawning the machine.
+    await sleep(10)
+    await wait_for_reconcile(app)
 
     try:
         await wait_for_completion(run, conclusion="success")
@@ -100,7 +114,7 @@ async def test_reactive_mode_spawns_runner(
             " it might be due to infrastructure issues"
         )
 
-    _assert_queue_is_empty(mongodb_uri, app.name)
+    assert_queue_is_empty(mongodb_uri, app.name)
 
     async def _runner_installed_in_metrics_log() -> bool:
         """Check if the runner_installed event is logged in the metrics log.
@@ -109,20 +123,52 @@ async def test_reactive_mode_spawns_runner(
             True if the runner_installed event is logged, False otherwise.
         """
         # trigger reconcile which extracts metrics
-        await reconcile(app, app.model)
+        await wait_for_reconcile(app)
         metrics_log = await get_metrics_log(app.units[0])
         log_lines = list(map(lambda line: json.loads(line), metrics_log.splitlines()))
         events = set(map(lambda line: line.get("event"), log_lines))
         return "runner_installed" in events
 
     try:
-        await wait_for(_runner_installed_in_metrics_log, check_interval=30, timeout=600)
+        await wait_for(_runner_installed_in_metrics_log, check_interval=30, timeout=60 * 10)
     except TimeoutError:
         assert False, "runner_installed event has not been logged"
 
     await _assert_metrics_are_logged(app, github_repository)
 
 
+@pytest.mark.abort_on_fail
+async def test_reactive_mode_with_not_found_job(
+    ops_test: OpsTest,
+    app: Application,
+):
+    """
+    arrange: Place a message in the queue with a non-existent job url.
+    act: Call reconcile.
+    assert: The message is removed from the queue.
+    """
+    mongodb_uri = await get_mongodb_uri(ops_test, app)
+
+    labels = {app.name, "x64"}  # The architecture label should be ignored in the
+    # label validation in the reactive consumer.
+    job = JobDetails(
+        labels=labels,
+        url="https://github.com/canonical/github-runner-operator/actions/runs/mock-run/job/mock-job",
+    )
+    add_to_queue(
+        json.dumps(json.loads(job.json()) | {"ignored_noise": "foobar"}),
+        mongodb_uri,
+        app.name,
+    )
+
+    # There may be a race condition between getting the token and spawning the machine.
+    await sleep(10)
+    await wait_for_reconcile(app)
+
+    assert_queue_is_empty(mongodb_uri, app.name)
+
+
+@pytest.mark.abort_on_fail
 async def test_reactive_mode_does_not_consume_jobs_with_unsupported_labels(
     ops_test: OpsTest,
     app: Application,
@@ -134,7 +180,7 @@ async def test_reactive_mode_does_not_consume_jobs_with_unsupported_labels(
     act: Call reconcile.
     assert: No runner is spawned and the message is not requeued.
     """
-    mongodb_uri = await _get_mongodb_uri(ops_test, app)
+    mongodb_uri = await get_mongodb_uri(ops_test, app)
     run = await dispatch_workflow(
         app=app,
         branch=test_github_branch,
@@ -143,8 +189,8 @@ async def test_reactive_mode_does_not_consume_jobs_with_unsupported_labels(
         workflow_id_or_name=DISPATCH_TEST_WORKFLOW_FILENAME,
         wait=False,
     )
-    job = _create_job_details(run=run, labels={"not supported label"})
-    _add_to_queue(
+    job = create_job_details(run=run, labels={"not supported label"})
+    add_to_queue(
         job.json(),
         mongodb_uri,
         app.name,
@@ -153,13 +199,14 @@ async def test_reactive_mode_does_not_consume_jobs_with_unsupported_labels(
     # wait for queue being empty, there could be a race condition where it takes some
     # time for the job message to be consumed and the queue to be empty
     try:
-        await wait_for(lambda: _get_queue_size(mongodb_uri, app.name) == 0)
+        await wait_for(lambda: get_queue_size(mongodb_uri, app.name) == 0)
         run.update()
         assert run.status == "queued"
     finally:
         run.cancel()  # cancel the run to avoid a queued run in GitHub actions page
 
 
+@pytest.mark.abort_on_fail
 async def test_reactive_mode_scale_down(
     ops_test: OpsTest,
     app: Application,
@@ -175,10 +222,10 @@ async def test_reactive_mode_scale_down(
         1. The job fails.
         2. The job is queued and there is a message in the queue.
     """
-    mongodb_uri = await _get_mongodb_uri(ops_test, app)
+    mongodb_uri = await get_mongodb_uri(ops_test, app)
 
-    await app.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "2"})
-    await reconcile(app, app.model)
+    await app.set_config({MAX_TOTAL_VIRTUAL_MACHINES_CONFIG_NAME: "2"})
+    await wait_for_reconcile(app)
 
     run = await dispatch_workflow(
         app=app,
@@ -188,8 +235,8 @@ async def test_reactive_mode_scale_down(
         workflow_id_or_name=DISPATCH_CRASH_TEST_WORKFLOW_FILENAME,
         wait=False,
     )
-    job = _create_job_details(run=run, labels={app.name})
-    _add_to_queue(
+    job = create_job_details(run=run, labels={app.name})
+    add_to_queue(
         job.json(),
         mongodb_uri,
         app.name,
@@ -198,12 +245,13 @@ async def test_reactive_mode_scale_down(
     await wait_for_status(run, "in_progress")
 
     # 1. Scale down the number of virtual machines to 0 and call reconcile.
-    await app.set_config({VIRTUAL_MACHINES_CONFIG_NAME: "0"})
-    await reconcile(app, app.model)
+    await app.set_config({MAX_TOTAL_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
+    await wait_for_reconcile(app)
 
     # we assume that the runner got deleted while running the job, so we expect a failed job
     await wait_for_completion(run, conclusion="failure")
-    _assert_queue_is_empty(mongodb_uri, app.name)
+    await wait_for_reconcile(app)
+    assert_queue_is_empty(mongodb_uri, app.name)
 
     # 2. Spawn a job.
     run = await dispatch_workflow(
@@ -214,179 +262,20 @@ async def test_reactive_mode_scale_down(
         workflow_id_or_name=DISPATCH_CRASH_TEST_WORKFLOW_FILENAME,
         wait=False,
     )
-    job = _create_job_details(run=run, labels={app.name})
-    _add_to_queue(
+    job = create_job_details(run=run, labels={app.name})
+    add_to_queue(
         job.json(),
         mongodb_uri,
         app.name,
     )
 
-    await reconcile(app, app.model)
+    await wait_for_reconcile(app)
 
     run.update()
     assert run.status == "queued"
     run.cancel()
 
-    _assert_queue_has_size(mongodb_uri, app.name, 1)
-
-
-async def _get_mongodb_uri(ops_test: OpsTest, app: Application) -> str:
-    """Get the mongodb uri.
-
-    Args:
-        ops_test: The ops_test plugin.
-        app: The juju application containing the unit.
-
-    Returns:
-        The mongodb uri.
-
-    """
-    mongodb_uri = await _get_mongodb_uri_from_integration_data(ops_test, app.units[0])
-    if not mongodb_uri:
-        mongodb_uri = await _get_mongodb_uri_from_secrets(ops_test, app.model)
-    assert mongodb_uri, "mongodb uri not found in integration data or secret"
-    return mongodb_uri
-
-
-async def _get_mongodb_uri_from_integration_data(ops_test: OpsTest, unit: Unit) -> str | None:
-    """Get the mongodb uri from the relation data.
-
-    Args:
-        ops_test: The ops_test plugin.
-        unit: The juju unit containing the relation data.
-
-    Returns:
-        The mongodb uri or None if not found.
-    """
-    mongodb_uri = None
-    _, unit_data, _ = await ops_test.juju("show-unit", unit.name, "--format", "json")
-    unit_data = json.loads(unit_data)
-
-    for rel_info in unit_data[unit.name]["relation-info"]:
-        if rel_info["endpoint"] == "mongodb":
-            try:
-                mongodb_uri = rel_info["application-data"]["uris"]
-                break
-            except KeyError:
-                pass
-
-    return mongodb_uri
-
-
-async def _get_mongodb_uri_from_secrets(ops_test, model: Model) -> str | None:
-    """Get the mongodb uri from the secrets.
-
-    Args:
-        ops_test: The ops_test plugin.
-        model: The juju model containing the unit.
-
-    Returns:
-        The mongodb uri or None if not found.
-    """
-    mongodb_uri = None
-
-    juju_secrets = await model.list_secrets()
-
-    # Juju < 3.6 returns a dictionary instead of a list
-    if not isinstance(juju_secrets, list):
-        juju_secrets = juju_secrets["results"]
-
-    for secret in juju_secrets:
-        if re.match(r"^database.\d+.user.secret$", secret.label):
-            _, show_secret, _ = await ops_test.juju(
-                "show-secret", secret.uri, "--reveal", "--format", "json"
-            )
-            show_secret = json.loads(show_secret)
-            for value in show_secret.values():
-                if "content" in value:
-                    mongodb_uri = value["content"]["Data"]["uris"]
-                    break
-            if mongodb_uri:
-                break
-    return mongodb_uri
-
-
-def _create_job_details(run: WorkflowRun, labels: set[str]) -> JobDetails:
-    """Create a JobDetails object.
-
-    Args:
-        run: The workflow run containing the job. Used to retrieve the job url. We assyne
-            the run only contains one job.
-        labels: The labels for the job.
-
-    Returns:
-        The job details.
-    """
-    jobs = list(run.jobs())
-    assert len(jobs) == 1, "Expected 1 job to be created"
-    job = jobs[0]
-    job_url = job.url
-    job = JobDetails(
-        labels=labels,
-        url=job_url,
-    )
-    return job
-
-
-def _add_to_queue(msg: str, mongodb_uri: str, queue_name: str) -> None:
-    """Add a message to a queue.
-
-    Args:
-        msg: The message to add to the queue.
-        mongodb_uri: The mongodb uri.
-        queue_name: The name of the queue to add the message to.
-    """
-    with Connection(mongodb_uri) as conn:
-        with conn.SimpleQueue(queue_name) as simple_queue:
-            simple_queue.put(msg, retry=True)
-
-
-def _clear_queue(mongodb_uri: str, queue_name: str) -> None:
-    """Clear the queue.
-
-    Args:
-        mongodb_uri: The mongodb uri.
-        queue_name: The name of the queue to clear.
-    """
-    with Connection(mongodb_uri) as conn:
-        with conn.SimpleQueue(queue_name) as simple_queue:
-            simple_queue.clear()
-
-
-def _assert_queue_is_empty(mongodb_uri: str, queue_name: str):
-    """Assert that the queue is empty.
-
-    Args:
-        mongodb_uri: The mongodb uri.
-        queue_name: The name of the queue to check.
-    """
-    _assert_queue_has_size(mongodb_uri, queue_name, 0)
-
-
-def _assert_queue_has_size(mongodb_uri: str, queue_name: str, size: int):
-    """Assert that the queue is empty.
-
-    Args:
-        mongodb_uri: The mongodb uri.
-        queue_name: The name of the queue to check.
-        size: The expected size of the queue.
-    """
-    assert _get_queue_size(mongodb_uri, queue_name) == size
-
-
-def _get_queue_size(mongodb_uri: str, queue_name: str) -> int:
-    """Get the size of the queue.
-
-    Args:
-        mongodb_uri: The mongodb uri.
-        queue_name: The name of the queue to check.
-
-    Returns:
-        The size of the queue.
-    """
-    with Connection(mongodb_uri) as conn:
-        with conn.SimpleQueue(queue_name) as simple_queue:
-            return simple_queue.qsize()
+    assert_queue_has_size(mongodb_uri, app.name, 1)
 
 
 async def _assert_metrics_are_logged(app: Application, github_repository: Repository):

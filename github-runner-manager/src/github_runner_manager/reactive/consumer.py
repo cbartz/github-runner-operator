@@ -4,39 +4,32 @@
 """Module responsible for consuming jobs from the message queue."""
 import contextlib
 import logging
+import re
 import signal
 import sys
 from contextlib import closing
-from enum import Enum
 from time import sleep
 from types import FrameType
 from typing import Generator, cast
+from urllib.parse import urlparse
 
 from kombu import Connection, Message
 from kombu.exceptions import KombuError
 from kombu.simple import SimpleQueue
 from pydantic import BaseModel, HttpUrl, ValidationError, validator
 
-from github_runner_manager.github_client import GithubClient
+from github_runner_manager.manager.models import RunnerMetadata
 from github_runner_manager.manager.runner_manager import RunnerManager
+from github_runner_manager.platform.platform_provider import JobNotFoundError, PlatformProvider
 from github_runner_manager.reactive.types_ import QueueConfig
-from github_runner_manager.types_.github import GitHubRepo
 
 logger = logging.getLogger(__name__)
 
 Labels = set[str]
 
-
-class JobPickedUpStates(str, Enum):
-    """The states of a job that indicate it has been picked up.
-
-    Attributes:
-        COMPLETED: The job has completed.
-        IN_PROGRESS: The job is in progress.
-    """
-
-    COMPLETED = "completed"
-    IN_PROGRESS = "in_progress"
+# This control message is for testing. The reactive process will stop consuming messages
+# when the message is sent. This message does not come from the router.
+END_PROCESSING_PAYLOAD = "__END__"
 
 
 class JobDetails(BaseModel):
@@ -97,10 +90,11 @@ def get_queue_size(queue_config: QueueConfig) -> int:
         raise QueueError("Error when communicating with the queue") from exc
 
 
-def consume(
+# Ignore `consume` too complex as it is pending re-design.
+def consume(  # noqa: C901
     queue_config: QueueConfig,
     runner_manager: RunnerManager,
-    github_client: GithubClient,
+    platform_provider: PlatformProvider,
     supported_labels: Labels,
 ) -> None:
     """Consume a job from the message queue.
@@ -111,12 +105,11 @@ def consume(
     Args:
         queue_config: The configuration for the message queue.
         runner_manager: The runner manager used to create the runner.
-        github_client: The GitHub client to use to check the job status.
+        platform_provider: Platform provider.
         supported_labels: The supported labels for the runner. If the job has unsupported labels,
             the message is requeued.
 
     Raises:
-        JobError: If the job details are invalid.
         QueueError: If an error when communicating with the queue occurs.
     """
     try:
@@ -125,38 +118,90 @@ def consume(
             closing(SimpleQueue(conn, queue_config.queue_name)) as simple_queue,
             signal_handler(signal.SIGTERM),
         ):
-            msg = simple_queue.get(block=True)
-            try:
-                job_details = cast(JobDetails, JobDetails.parse_raw(msg.payload))
-            except ValidationError as exc:
-                logger.error("Found invalid job details, will reject the message.")
-                msg.reject(requeue=False)
-                raise JobError(f"Invalid job details: {msg.payload}") from exc
-            logger.info(
-                "Received job with labels %s and job_url %s",
-                job_details.labels,
-                job_details.url,
-            )
-            if not _validate_labels(labels=job_details.labels, supported_labels=supported_labels):
-                logger.error(
-                    "Found unsupported job labels in %s. "
-                    "Will not spawn a runner and reject the message.",
-                    job_details.labels,
-                )
-                # We currently do not expect this to happen, but we should handle it.
-                # We do not want to requeue the message as it will be rejected again.
-                # This may change in the future when messages for multiple
-                # flavours are sent to the same queue.
-                msg.reject(requeue=False)
-            else:
+            # Get messages until we can spawn a runner.
+            while True:
+                msg = simple_queue.get(block=True)
+                # Payload to stop the processing
+                if msg.payload == END_PROCESSING_PAYLOAD:
+                    msg.ack()
+                    break
+                job_details = _parse_job_details(msg)
+                logger.info("Received reactive job: %s", job_details)
+                if not _validate_labels(
+                    labels=job_details.labels, supported_labels=supported_labels
+                ):
+                    logger.error(
+                        "Found unsupported job labels in %s. "
+                        "Will not spawn a runner and reject the message.",
+                        job_details.labels,
+                    )
+                    # We currently do not expect this to happen, but we should handle it.
+                    # We do not want to requeue the message as it will be rejected again.
+                    # This may change in the future when messages for multiple
+                    # flavours are sent to the same queue.
+                    msg.reject(requeue=False)
+                    continue
+                try:
+                    metadata = _build_runner_metadata(job_details.url)
+                except ValueError:
+                    msg.reject(requeue=False)
+                    break
+                try:
+                    if platform_provider.check_job_been_picked_up(
+                        metadata=metadata, job_url=job_details.url
+                    ):
+                        logger.info("reactive job: %s already picked up.", job_details)
+                        msg.ack()
+                        continue
+                except JobNotFoundError:
+                    logger.warning(
+                        "Unable to find the job %s. Not retrying this job.", job_details.url
+                    )
+                    msg.reject(requeue=False)
                 _spawn_runner(
                     runner_manager=runner_manager,
                     job_url=job_details.url,
                     msg=msg,
-                    github_client=github_client,
+                    platform_provider=platform_provider,
+                    metadata=metadata,
                 )
+                break
     except KombuError as exc:
         raise QueueError("Error when communicating with the queue") from exc
+
+
+def _build_runner_metadata(job_url: str) -> RunnerMetadata:
+    """Build runner metadata from the job url."""
+    parsed_url = urlparse(job_url)
+    # We expect the netloc to contain github.com, otherwise this function will fail,
+    # as will use jobmanager code to handle github runners.
+    if "github.com" in parsed_url.netloc:
+        return RunnerMetadata()
+
+    # From here on jobmanager. For now we just regex on the url to check if it is the url
+    # of a runner.
+    match_result = re.match(r"^(.*)/v1/jobs/(\d+)$", parsed_url.path)
+    if not match_result:
+        logger.error("Invalid URL for a job. url: %s", job_url)
+        raise ValueError(f"Invalid format for job url {job_url}")
+    base_url = parsed_url._replace(path=match_result.group(1)).geturl()
+    return RunnerMetadata(platform_name="jobmanager", url=base_url)
+
+
+def _parse_job_details(msg: Message) -> JobDetails:
+    """Parse JobDetails from a message."""
+    try:
+        job_details = cast(JobDetails, JobDetails.parse_raw(msg.payload))
+    except ValidationError as exc:
+        logger.error("Found invalid job details, will reject the message.")
+        msg.reject(requeue=False)
+        raise JobError(f"Invalid job details: {msg.payload}") from exc
+    logger.info(
+        "Received job with labels %s and job_url %s",
+        job_details.labels,
+        job_details.url,
+    )
+    return job_details
 
 
 def _validate_labels(labels: Labels, supported_labels: Labels) -> bool:
@@ -173,7 +218,11 @@ def _validate_labels(labels: Labels, supported_labels: Labels) -> bool:
 
 
 def _spawn_runner(
-    runner_manager: RunnerManager, job_url: HttpUrl, msg: Message, github_client: GithubClient
+    runner_manager: RunnerManager,
+    job_url: HttpUrl,
+    msg: Message,
+    platform_provider: PlatformProvider,
+    metadata: RunnerMetadata,
 ) -> None:
     """Spawn a runner.
 
@@ -187,52 +236,31 @@ def _spawn_runner(
         runner_manager: The runner manager to use.
         job_url: The URL of the job.
         msg: The message to acknowledge or reject.
-        github_client: The GitHub client to use to check the job status.
+        platform_provider: Platform provider.
+        metadata: RunnerMetadata for the runner to spawn..
     """
-    if _check_job_been_picked_up(job_url=job_url, github_client=github_client):
-        msg.ack()
-        return
-    instance_ids = runner_manager.create_runners(1)
+    logger.info("Spawning new reactive runner for job %s", job_url)
+    instance_ids = runner_manager.create_runners(1, metadata=metadata, reactive=True)
     if not instance_ids:
-        logger.error("Failed to spawn a runner. Will reject the message.")
+        logger.error("Failed to spawn a runner for job %s. Will reject the message.", job_url)
         msg.reject(requeue=True)
         return
-    for _ in range(10):
-        if _check_job_been_picked_up(job_url=job_url, github_client=github_client):
+    logger.info("Reactive runner spawned %s", instance_ids)
+
+    for _ in range(5):
+        sleep(60)
+        logger.info("Checking if job picked up for reactive runner %s", instance_ids)
+        if platform_provider.check_job_been_picked_up(metadata=metadata, job_url=job_url):
+            logger.info("Job picked %s. reactive runner ok %s", job_url, instance_ids)
             msg.ack()
             break
-        sleep(30)
     else:
+        logger.info(
+            "Job %s not picked by reactive runner %s. Probably picked up by another job",
+            job_url,
+            instance_ids,
+        )
         msg.reject(requeue=True)
-
-
-def _check_job_been_picked_up(job_url: HttpUrl, github_client: GithubClient) -> bool:
-    """Check if the job has already been picked up.
-
-    Args:
-        job_url: The URL of the job.
-        github_client: The GitHub client to use to check the job status.
-
-    Returns:
-        True if the job has been picked up, False otherwise.
-    """
-    # job_url has the format:
-    # "https://api.github.com/repos/cbartz/gh-runner-test/actions/jobs/22428484402"
-    path = job_url.path
-    # we know that path is not empty as it is validated by the JobDetails model
-    job_url_path_parts = path.split("/")  # type: ignore
-    job_id = job_url_path_parts[-1]
-    owner = job_url_path_parts[2]
-    repo = job_url_path_parts[3]
-    logging.debug(
-        "Parsed job_id: %s, owner: %s, repo: %s from job_url path %s", job_id, owner, repo, path
-    )
-
-    # See response format:
-    # https://docs.github.com/en/rest/actions/workflow-jobs?apiVersion=2022-11-28#get-a-job-for-a-workflow-run
-
-    job_info = github_client.get_job_info(path=GitHubRepo(owner=owner, repo=repo), job_id=job_id)
-    return job_info.status in [*JobPickedUpStates]
 
 
 @contextlib.contextmanager

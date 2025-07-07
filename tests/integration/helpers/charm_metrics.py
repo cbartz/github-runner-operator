@@ -8,24 +8,19 @@ import json
 import logging
 from time import sleep
 
-import requests
 from github.Branch import Branch
 from github.GithubException import GithubException
 from github.Repository import Repository
 from github.Workflow import Workflow
 from github.WorkflowJob import WorkflowJob
+from github_runner_manager.manager.cloud_runner_manager import PostJobStatus
 from github_runner_manager.metrics.events import METRICS_LOG_PATH
-from github_runner_manager.metrics.runner import PostJobStatus
 from github_runner_manager.types_.github import JobConclusion
 from juju.application import Application
 from juju.unit import Unit
 
-from tests.integration.helpers.common import (
-    InstanceHelper,
-    get_file_content,
-    run_in_unit,
-    wait_for,
-)
+from tests.integration.helpers.common import get_file_content, run_in_unit, wait_for
+from tests.integration.helpers.openstack import OpenStackInstanceHelper
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +34,7 @@ TEST_WORKFLOW_NAMES = [
 async def wait_for_workflow_to_start(
     unit: Unit,
     workflow: Workflow,
-    instance_helper: InstanceHelper,
+    instance_helper: OpenStackInstanceHelper,
     branch: Branch | None = None,
     started_time: float | None = None,
     timeout: int = 20 * 60,
@@ -77,13 +72,10 @@ async def wait_for_workflow_to_start(
                 return False
             try:
                 job: WorkflowJob = jobs[0]
-                logs = requests.get(job.logs_url()).content.decode("utf-8")
+                if runner_name == job.runner_name:
+                    return True
             except GithubException as exc:
-                if exc.status == 410:
-                    logger.warning("Transient github error, %s", exc)
-                    return False
-            if runner_name in logs:
-                return True
+                logger.warning("Github error, %s", exc)
         return False
 
     try:
@@ -105,28 +97,6 @@ async def clear_metrics_log(unit: Unit) -> None:
     assert retcode == 0, f"Failed to clear metrics log, {stderr}"
 
 
-async def print_loop_device_info(unit: Unit, loop_device: str) -> None:
-    """Print loop device info on the unit.
-
-    Args:
-        unit: The unit to print the loop device info on.
-        loop_device: The loop device to print the info for.
-    """
-    retcode, stdout, stderr = await run_in_unit(
-        unit=unit,
-        command="sudo losetup -lJ",
-    )
-    assert retcode == 0, f"Failed to get loop devices: {stdout} {stderr}"
-    assert stdout is not None, "Failed to get loop devices, no stdout message"
-    loop_devices_info = json.loads(stdout)
-    for loop_device_info in loop_devices_info["loopdevices"]:
-        if loop_device_info["name"] == loop_device:
-            logging.info("Loop device %s info: %s", loop_device, loop_device_info)
-            break
-    else:
-        logging.info("Loop device %s not found", loop_device)
-
-
 async def get_metrics_log(unit: Unit) -> str:
     """Retrieve the metrics log from the unit.
 
@@ -140,7 +110,10 @@ async def get_metrics_log(unit: Unit) -> str:
 
 
 async def cancel_workflow_run(
-    unit: Unit, workflow: Workflow, instance_helper: InstanceHelper, branch: Branch | None = None
+    unit: Unit,
+    workflow: Workflow,
+    instance_helper: OpenStackInstanceHelper,
+    branch: Branch | None = None,
 ):
     """Cancel the workflow run.
 
@@ -158,12 +131,12 @@ async def cancel_workflow_run(
             continue
         try:
             job: WorkflowJob = jobs[0]
-            logs = requests.get(job.logs_url()).content.decode("utf-8")
         except GithubException as exc:
             if exc.status == 410:
                 logger.warning("Transient github error, %s", exc)
                 continue
-        if runner_name in logs:
+            logger.warning("Github error, %s", exc)
+        if runner_name == job.runner_name:
             run.cancel()
 
 
@@ -229,7 +202,7 @@ async def assert_events_after_reconciliation(
             if not reactive_mode:
                 assert metric_log.get("expected_runners") >= 0
             else:
-                assert "expected_runners" not in metric_log
+                assert metric_log.get("expected_runners") == 0
 
 
 async def wait_for_runner_to_be_marked_offline(

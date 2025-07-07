@@ -29,7 +29,7 @@ The first cloud in the `clouds.yaml` is used by the charm.
 
 Here is a sample of the `clouds.yaml`:
 
-```yaml
+```
 clouds:
   cloud:
     auth:
@@ -58,5 +58,5 @@ Note that the network should be configured to allow traffic from the charm deplo
 
 The network documentation is [here](https://docs.openstack.org/neutron/latest/admin/intro-os-networking.html).
 
-> NOTE: The name of the application must not be longer than 50 characters. A valid runner name is 64 characters or less in length and does not include '"', '/', ':',
-'<', '>', '\', '|', '*' and '?'. 14 characters are reserved for Juju unit number and unique identifier.
+> NOTE: The name of the application must not be longer than 48 characters. A valid runner name is 64 characters or less in length and does not include '"', '/', ':',
+'<', '>', '\', '|', '*' and '?'. 16 characters are reserved for Juju unit number, unique identifier and other information.

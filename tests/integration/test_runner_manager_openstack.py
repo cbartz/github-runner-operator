@@ -19,30 +19,27 @@ import yaml
 from github.Branch import Branch
 from github.Repository import Repository
 from github.Workflow import Workflow
-from github_runner_manager.manager.cloud_runner_manager import (
-    CloudRunnerState,
-    GitHubRunnerConfig,
-    SupportServiceConfig,
-)
-from github_runner_manager.manager.github_runner_manager import GitHubRunnerState
-from github_runner_manager.manager.runner_manager import (
-    FlushMode,
-    RunnerManager,
-    RunnerManagerConfig,
-)
+from github_runner_manager.configuration import ProxyConfig, SupportServiceConfig, UserInfo
+from github_runner_manager.configuration.github import GitHubPath, parse_github_path
+from github_runner_manager.github_client import GithubClient
+from github_runner_manager.manager.cloud_runner_manager import CloudRunnerState
+from github_runner_manager.manager.models import RunnerMetadata
+from github_runner_manager.manager.runner_manager import FlushMode, RunnerManager
 from github_runner_manager.metrics import events
-from github_runner_manager.openstack_cloud import health_checks
-from github_runner_manager.openstack_cloud.openstack_runner_manager import (
+from github_runner_manager.openstack_cloud import constants
+from github_runner_manager.openstack_cloud.models import (
     OpenStackCredentials,
-    OpenStackRunnerManager,
     OpenStackRunnerManagerConfig,
     OpenStackServerConfig,
 )
-from github_runner_manager.types_ import SystemUserConfig
-from github_runner_manager.types_.github import GitHubPath, parse_github_path
+from github_runner_manager.openstack_cloud.openstack_runner_manager import OpenStackRunnerManager
+from github_runner_manager.platform.github_provider import (
+    GitHubRunnerPlatform,
+    PlatformRunnerState,
+)
+from github_runner_manager.types_.github import GitHubRunnerStatus
 from openstack.connection import Connection as OpenstackConnection
 
-from charm_state import ProxyConfig
 from tests.integration.helpers.common import (
     DISPATCH_WAIT_TEST_WORKFLOW_FILENAME,
     dispatch_workflow,
@@ -50,6 +47,26 @@ from tests.integration.helpers.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A higher create server timeout is reasonable for integration tests,
+# as only one machine that stays for more than the default time in BUILD,
+# will break the tests
+constants.CREATE_SERVER_TIMEOUT = 900
+
+
+@pytest.fixture(autouse=True, scope="module", name="runner_manager_user")
+def runner_manager_user():
+    """Mock the RUNNER_MANAGER_USER and RUNNER_MANAGER_GROUP constants.
+
+    Yields:
+        None, just to be in a scope.
+    """
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        # we assume the test runs as ubuntu user
+        monkeypatch.setattr("github_runner_manager.constants.RUNNER_MANAGER_USER", "ubuntu")
+        monkeypatch.setattr("github_runner_manager.constants.RUNNER_MANAGER_GROUP", "ubuntu")
+        # monkeypatch is a scope function fixture, so this trick
+        yield None
 
 
 @pytest.fixture(scope="module", name="runner_label")
@@ -74,6 +91,11 @@ def log_dir_base_path_fixture(
         }
 
 
+@pytest.fixture(scope="module", name="prefix")
+def prefix_fixture(app_name: str) -> str:
+    return f"{app_name}-0"
+
+
 @pytest.fixture(scope="module", name="github_path")
 def github_path_fixture(path: str) -> GitHubPath:
     return parse_github_path(path, "Default")
@@ -83,22 +105,19 @@ def github_path_fixture(path: str) -> GitHubPath:
 def openstack_proxy_config_fixture(
     openstack_http_proxy: str, openstack_https_proxy: str, openstack_no_proxy: str
 ) -> ProxyConfig:
-    use_aproxy = False
-    if openstack_http_proxy or openstack_https_proxy:
-        use_aproxy = True
     http_proxy = openstack_http_proxy if openstack_http_proxy else None
     https_proxy = openstack_https_proxy if openstack_https_proxy else None
     return ProxyConfig(
         http=http_proxy,
         https=https_proxy,
         no_proxy=openstack_no_proxy,
-        use_aproxy=use_aproxy,
     )
 
 
 @pytest_asyncio.fixture(scope="module", name="openstack_runner_manager")
 async def openstack_runner_manager_fixture(
     app_name: str,
+    prefix: str,
     private_endpoint_clouds_yaml: str,
     openstack_test_image: str,
     flavor_name: str,
@@ -139,64 +158,91 @@ async def openstack_runner_manager_fixture(
         flavor=flavor_name,
         network=network_name,
     )
-    runner_config = GitHubRunnerConfig(
-        github_path=github_path,
-        labels=["openstack_test", runner_label],
-    )
+
+    use_aproxy = bool(proxy_config.proxy_address)
+
     service_config = SupportServiceConfig(
         proxy_config=proxy_config,
+        runner_proxy_config=proxy_config,
         dockerhub_mirror=None,
-        ssh_debug_connections=None,
+        ssh_debug_connections=[],
         repo_policy_compliance=None,
+        use_aproxy=use_aproxy,
     )
 
     openstack_runner_manager_config = OpenStackRunnerManagerConfig(
         name=app_name,
-        prefix=f"{app_name}-0",
+        prefix=prefix,
         credentials=credentials,
         server_config=server_config,
-        runner_config=runner_config,
         service_config=service_config,
-        # we assume the test runs as ubuntu user
-        system_user_config=SystemUserConfig(user="ubuntu", group="ubuntu"),
     )
+    user = UserInfo("ubuntu", "ubuntu")
 
     yield OpenStackRunnerManager(
         config=openstack_runner_manager_config,
+        user=user,
     )
+
+
+@pytest.fixture(scope="module", name="github_client_for_manager")
+def github_client_for_manager_fixture(token: str) -> GithubClient:
+    github_client = GithubClient(token)
+    return github_client
+
+
+@pytest.fixture(scope="module", name="github_platform")
+def github_platform_fixture(
+    token: str,
+    prefix: str,
+    github_path: GitHubPath,
+    github_client_for_manager: GithubClient,
+) -> GitHubRunnerPlatform:
+    github_platform = GitHubRunnerPlatform(
+        prefix=prefix,
+        path=github_path,
+        github_client=github_client_for_manager,
+    )
+    return github_platform
 
 
 @pytest_asyncio.fixture(scope="module", name="runner_manager")
 async def runner_manager_fixture(
     openstack_runner_manager: OpenStackRunnerManager,
-    token: str,
     log_dir_base_path: dict[str, Path],
-    github_path: GitHubPath,
+    runner_label: str,
+    github_platform: GitHubRunnerPlatform,
 ) -> AsyncGenerator[RunnerManager, None]:
     """Get RunnerManager instance.
 
     Import of log_dir_base_path to monkeypatch the runner logs path with tmp_path.
     """
-    config = RunnerManagerConfig("test_runner", token, github_path)
-    yield RunnerManager(openstack_runner_manager, config)
+    yield RunnerManager(
+        manager_name="test_runner",
+        platform_provider=github_platform,
+        cloud_runner_manager=openstack_runner_manager,
+        labels=["openstack_test", runner_label],
+    )
 
 
 @pytest_asyncio.fixture(scope="function", name="runner_manager_with_one_runner")
 async def runner_manager_with_one_runner_fixture(runner_manager: RunnerManager) -> RunnerManager:
-    runner_manager.create_runners(1)
-    runner_list = runner_manager.get_runners()
+    runner_manager.flush_runners(flush_mode=FlushMode.FLUSH_BUSY)
+    await wait_runner_amount(runner_manager, 0)
+    runner_manager.create_runners(1, RunnerMetadata())
     try:
         await wait_runner_amount(runner_manager, 1)
     except TimeoutError as err:
         raise AssertionError("Test arrange failed: Expect one runner") from err
 
+    runner_list = runner_manager.get_runners()
     runner = runner_list[0]
     assert (
         runner.cloud_state == CloudRunnerState.ACTIVE
     ), "Test arrange failed: Expect runner in active state"
     try:
         await wait_for(
-            lambda: runner_manager.get_runners()[0].github_state == GitHubRunnerState.IDLE,
+            lambda: runner_manager.get_runners()[0].platform_state == PlatformRunnerState.IDLE,
             timeout=120,
             check_interval=10,
         )
@@ -232,17 +278,31 @@ async def wait_runner_amount(
         timeout: The timeout in seconds.
         check_interval: The interval to check in seconds.
     """
-    runner_list = runner_manager.get_runners()
-    assert isinstance(runner_list, tuple)
-    if len(runner_list) == num:
-        return
-
     # The openstack server can take sometime to fully clean up or create.
     await wait_for(
-        lambda: len(runner_manager.get_runners()) == num,
+        lambda: check_runners_amount_and_active(runner_manager, num),
         timeout=timeout,
         check_interval=check_interval,
     )
+
+
+def check_runners_amount_and_active(runner_manager: RunnerManager, num: int) -> bool:
+    """Check if the number of runners match the expected amount and all runners are active.
+
+    Args:
+        runner_manager: The RunnerManager instance to use.
+        num: The expected number of runners.
+
+    Returns:
+        Whether the expected number of runner is spawned and active.
+    """
+    runners = runner_manager.get_runners()
+    active_runners = [
+        runner for runner in runners if runner.cloud_state == CloudRunnerState.ACTIVE
+    ]
+    if len(runners) == len(active_runners) and len(runners) == num:
+        return True
+    return False
 
 
 @pytest.mark.openstack
@@ -263,7 +323,10 @@ async def test_get_no_runner(runner_manager: RunnerManager) -> None:
 @pytest.mark.asyncio
 @pytest.mark.abort_on_fail
 async def test_runner_normal_idle_lifecycle(
-    runner_manager: RunnerManager, openstack_runner_manager: OpenStackRunnerManager
+    runner_manager: RunnerManager,
+    openstack_runner_manager: OpenStackRunnerManager,
+    github_client_for_manager: GithubClient,
+    github_path: GitHubPath,
 ) -> None:
     """
     Arrange: RunnerManager instance with no runners.
@@ -279,7 +342,7 @@ async def test_runner_normal_idle_lifecycle(
         4. No runners.
     """
     # 1.
-    runner_id_list = runner_manager.create_runners(1)
+    runner_id_list = runner_manager.create_runners(1, RunnerMetadata())
     assert isinstance(runner_id_list, tuple)
     assert len(runner_id_list) == 1
     runner_id = runner_id_list[0]
@@ -295,9 +358,10 @@ async def test_runner_normal_idle_lifecycle(
     runner = runner_list[0]
     assert runner.instance_id == runner_id
     assert runner.cloud_state == CloudRunnerState.ACTIVE
+    assert runner.metadata.platform_name == "github"
     # Update on GitHub-side can take a bit of time.
     await wait_for(
-        lambda: runner_manager.get_runners()[0].github_state == GitHubRunnerState.IDLE,
+        lambda: runner_manager.get_runners()[0].platform_state == PlatformRunnerState.IDLE,
         timeout=120,
         check_interval=10,
     )
@@ -308,8 +372,10 @@ async def test_runner_normal_idle_lifecycle(
     assert len(openstack_instances) == 1, "Test arrange failed: Needs one runner."
     runner = openstack_instances[0]
 
-    ssh_conn = openstack_runner_manager._openstack_cloud.get_ssh_connection(runner)
-    assert health_checks.check_active_runner(ssh_conn=ssh_conn, instance=runner)
+    self_hosted_runner = github_client_for_manager.get_runner(
+        github_path, runner.instance_id.prefix, int(runner.metadata.runner_id)
+    )
+    assert self_hosted_runner.status == GitHubRunnerStatus.ONLINE
 
     # 3.
     runner_manager.cleanup()
@@ -361,7 +427,7 @@ async def test_runner_flush_busy_lifecycle(
     assert len(runner_list) == 1
     busy_runner = runner_list[0]
     assert busy_runner.cloud_state == CloudRunnerState.ACTIVE
-    assert busy_runner.github_state == GitHubRunnerState.BUSY
+    assert busy_runner.platform_state == PlatformRunnerState.BUSY
 
     # 2.
     runner_manager_with_one_runner.cleanup()
@@ -370,7 +436,7 @@ async def test_runner_flush_busy_lifecycle(
     assert len(runner_list) == 1
     runner = runner_list[0]
     assert runner.cloud_state == CloudRunnerState.ACTIVE
-    assert busy_runner.github_state == GitHubRunnerState.BUSY
+    assert busy_runner.platform_state == PlatformRunnerState.BUSY
 
     # 3.
     runner_manager_with_one_runner.flush_runners(flush_mode=FlushMode.FLUSH_IDLE)
@@ -378,7 +444,7 @@ async def test_runner_flush_busy_lifecycle(
     assert len(runner_list) == 1
     busy_runner = runner_list[0]
     assert busy_runner.cloud_state == CloudRunnerState.ACTIVE
-    assert busy_runner.github_state == GitHubRunnerState.BUSY
+    assert busy_runner.platform_state == PlatformRunnerState.BUSY
 
     # 4.
     runner_manager_with_one_runner.flush_runners(flush_mode=FlushMode.FLUSH_BUSY)
@@ -408,6 +474,7 @@ async def test_runner_normal_lifecycle(
         1. The workflow complete successfully.
         2. The runner should be deleted. The metrics should be recorded.
     """
+    logger.info("Starting test_runner_normal_lifecycle")
     metric_log_path = log_dir_base_path["metric_log"]
     try:
         metric_log_existing_content = metric_log_path.read_text(encoding="utf-8")
@@ -437,7 +504,7 @@ async def test_runner_normal_lifecycle(
         """
         runners = runner_manager_with_one_runner.get_runners()
         assert len(runners) == 1
-        return runners[0].github_state in (GitHubRunnerState.OFFLINE, None)
+        return runners[0].platform_state in (PlatformRunnerState.OFFLINE, None)
 
     await wait_for(is_runner_offline, check_interval=60, timeout=600)
 
@@ -499,7 +566,7 @@ async def test_runner_spawn_two(
         2. No runners.
     """
     # 1.
-    runner_id_list = runner_manager.create_runners(2)
+    runner_id_list = runner_manager.create_runners(2, RunnerMetadata())
     assert isinstance(runner_id_list, tuple)
     assert len(runner_id_list) == 2
 

@@ -1,4 +1,4 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Integration tests for metrics/logs assuming no Github workflow failures."""
@@ -6,13 +6,13 @@
 import json
 from typing import AsyncIterator
 
+import jubilant
 import pytest
 import pytest_asyncio
 from github.Branch import Branch
 from github.Repository import Repository
-from github_runner_manager.manager.cloud_runner_manager import PostJobStatus
+from github_runner_manager.manager.vm_manager import PostJobStatus
 from juju.application import Application
-from juju.model import Model
 
 from charm_state import BASE_VIRTUAL_MACHINES_CONFIG_NAME
 from tests.integration.helpers.charm_metrics import (
@@ -29,7 +29,7 @@ from tests.integration.helpers.openstack import OpenStackInstanceHelper
 
 
 @pytest_asyncio.fixture(scope="function", name="app")
-async def app_fixture(model: Model, app_for_metric: Application) -> AsyncIterator[Application]:
+async def app_fixture(app_for_metric: Application) -> AsyncIterator[Application]:
     """Setup and teardown the charm after each test.
 
     Clear the metrics log before each test.
@@ -44,17 +44,17 @@ async def app_fixture(model: Model, app_for_metric: Application) -> AsyncIterato
 @pytest.mark.asyncio
 @pytest.mark.abort_on_fail
 async def test_charm_issues_runner_installed_metric(
-    app: Application, instance_helper: OpenStackInstanceHelper
+    juju: jubilant.Juju, app: Application, instance_helper: OpenStackInstanceHelper
 ):
     """
-    arrange: A charm integrated with grafana-agent using the cos-agent integration.
+    arrange: A working charm deployment.
     act: Config the charm to contain one runner.
     assert: The RunnerInstalled metric is logged.
     """
     await instance_helper.ensure_charm_has_runner(app)
 
     # Set the number of virtual machines to 0 to speedup reconciliation
-    await app.set_config({BASE_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
+    juju.config(app.name, values={BASE_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
     await wait_for_reconcile(app=app)
 
     metrics_log = await get_metrics_log(app.units[0])
@@ -73,6 +73,7 @@ async def test_charm_issues_runner_installed_metric(
 @pytest.mark.asyncio
 @pytest.mark.abort_on_fail
 async def test_charm_issues_metrics_after_reconciliation(
+    juju: jubilant.Juju,
     app: Application,
     github_repository: Repository,
     test_github_branch: Branch,
@@ -98,7 +99,7 @@ async def test_charm_issues_metrics_after_reconciliation(
     )
 
     # Set the number of virtual machines to 0 to speedup reconciliation
-    await app.set_config({BASE_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
+    juju.config(app.name, values={BASE_VIRTUAL_MACHINES_CONFIG_NAME: "0"})
     await wait_for_reconcile(app=app)
 
     await assert_events_after_reconciliation(

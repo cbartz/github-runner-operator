@@ -1,16 +1,15 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """State of the Charm."""
 
 import dataclasses
+import ipaddress
 import json
 import logging
-import platform
 import re
-from enum import Enum
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Final, Literal, cast
 from urllib.parse import urlsplit
 
 import yaml
@@ -18,8 +17,8 @@ from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from github_runner_manager.configuration import ProxyConfig, SSHDebugConnection
 from github_runner_manager.configuration.github import GitHubPath, parse_github_path
 from ops import CharmBase
+from ops.model import SecretNotFoundError
 from pydantic import (
-    AnyHttpUrl,
     BaseModel,
     MongoDsn,
     ValidationError,
@@ -28,6 +27,7 @@ from pydantic import (
 )
 
 from errors import MissingMongoDBError
+from models import AnyHttpsUrl, FlavorLabel, OpenStackCloudsYAML
 from utilities import get_env_var
 
 logger = logging.getLogger(__name__)
@@ -37,9 +37,9 @@ ARCHITECTURES_X86 = {"x86_64"}
 
 CHARM_STATE_PATH = Path("charm_state.json")
 
+ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME = "allow-external-contributor"
 BASE_VIRTUAL_MACHINES_CONFIG_NAME = "base-virtual-machines"
 DOCKERHUB_MIRROR_CONFIG_NAME = "dockerhub-mirror"
-# bandit thinks this is a hardcoded password
 FLAVOR_LABEL_COMBINATIONS_CONFIG_NAME = "flavor-label-combinations"
 GROUP_CONFIG_NAME = "group"
 LABELS_CONFIG_NAME = "labels"
@@ -50,34 +50,82 @@ OPENSTACK_NETWORK_CONFIG_NAME = "openstack-network"
 OPENSTACK_FLAVOR_CONFIG_NAME = "openstack-flavor"
 PATH_CONFIG_NAME = "path"
 RECONCILE_INTERVAL_CONFIG_NAME = "reconcile-interval"
-# bandit thinks this is a hardcoded password
-REPO_POLICY_COMPLIANCE_TOKEN_CONFIG_NAME = "repo-policy-compliance-token"  # nosec
-REPO_POLICY_COMPLIANCE_URL_CONFIG_NAME = "repo-policy-compliance-url"
 RUNNER_HTTP_PROXY_CONFIG_NAME = "runner-http-proxy"
 SENSITIVE_PLACEHOLDER = "*****"
 TEST_MODE_CONFIG_NAME = "test-mode"
 # bandit thinks this is a hardcoded password.
 TOKEN_CONFIG_NAME = "token"  # nosec
 USE_APROXY_CONFIG_NAME = "experimental-use-aproxy"
+APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME = "aproxy-exclude-addresses"
+APROXY_REDIRECT_PORTS_CONFIG_NAME = "aproxy-redirect-ports"
 USE_RUNNER_PROXY_FOR_TMATE_CONFIG_NAME = "use-runner-proxy-for-tmate"
 VIRTUAL_MACHINES_CONFIG_NAME = "virtual-machines"
 CUSTOM_PRE_JOB_SCRIPT_CONFIG_NAME = "pre-job-script"
+RUNNER_MANAGER_LOG_LEVEL_CONFIG_NAME = "runner-manager-log-level"
 
 # Integration names
 COS_AGENT_INTEGRATION_NAME = "cos-agent"
 DEBUG_SSH_INTEGRATION_NAME = "debug-ssh"
 IMAGE_INTEGRATION_NAME = "image"
 MONGO_DB_INTEGRATION_NAME = "mongodb"
+PLANNER_INTEGRATION_NAME = "planner"
+
+# Keys and defaults for planner relation app data bag
+PLANNER_FLAVOR_RELATION_KEY: Final[str] = "flavor"
+PLANNER_LABELS_RELATION_KEY: Final[str] = "labels"
+PLANNER_PLATFORM_RELATION_KEY: Final[str] = "platform"
+PLANNER_PRIORITY_RELATION_KEY: Final[str] = "priority"
+PLANNER_MINIMUM_PRESSURE_RELATION_KEY: Final[str] = "minimum-pressure"
+PLANNER_DEFAULT_PLATFORM: Final[str] = "github"
+PLANNER_DEFAULT_PRIORITY: Final[int] = 50
+
+LogLevel = Literal["CRITICAL", "FATAL", "ERROR", "WARNING", "INFO", "DEBUG"]
 
 
-class AnyHttpsUrl(AnyHttpUrl):
-    """Represents an HTTPS URL.
+@dataclasses.dataclass(frozen=True)
+class PlannerRelationData:
+    """Data written to the planner relation app databag.
 
     Attributes:
-        allowed_schemes: Allowed schemes for the URL.
+        flavor: The flavor name (app name).
+        labels: Runner labels for this flavor.
+        platform: The platform identifier.
+        priority: Scheduling priority.
+        minimum_pressure: Minimum number of runners to maintain.
     """
 
-    allowed_schemes = {"https"}
+    flavor: str
+    labels: tuple[str, ...]
+    platform: str = PLANNER_DEFAULT_PLATFORM
+    priority: int = PLANNER_DEFAULT_PRIORITY
+    minimum_pressure: int = 0
+
+    def to_relation_data(self) -> dict[str, str]:
+        """Serialize to relation databag format.
+
+        Returns:
+            Dictionary of string key-value pairs for the Juju relation databag.
+        """
+        return {
+            PLANNER_FLAVOR_RELATION_KEY: self.flavor,
+            PLANNER_LABELS_RELATION_KEY: json.dumps(list(self.labels)),
+            PLANNER_PLATFORM_RELATION_KEY: self.platform,
+            PLANNER_PRIORITY_RELATION_KEY: str(self.priority),
+            PLANNER_MINIMUM_PRESSURE_RELATION_KEY: str(self.minimum_pressure),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PlannerConfig:
+    """Data read from planner relation unit databag.
+
+    Attributes:
+        endpoint: Planner service endpoint URL.
+        token: Planner authentication bearer token.
+    """
+
+    endpoint: str
+    token: str
 
 
 @dataclasses.dataclass
@@ -113,14 +161,6 @@ class GithubConfig:
         if not path_str:
             raise CharmConfigInvalidError(f"Missing {PATH_CONFIG_NAME} configuration")
 
-        # check if path_str is an url using pydantic
-        if path_str.startswith("http://") or path_str.startswith("https://"):
-            logger.info(
-                "Detected URL in %s configuration, will use experimental jobmanager mode",
-                PATH_CONFIG_NAME,
-            )
-            return None
-
         try:
             path = parse_github_path(cast(str, path_str), cast(str, runner_group))
         except ValueError as e:
@@ -130,52 +170,6 @@ class GithubConfig:
             raise CharmConfigInvalidError(f"Missing {TOKEN_CONFIG_NAME} configuration")
 
         return cls(token=cast(str, token), path=path)
-
-
-class JobManagerConfig(BaseModel):
-    """Configuration for the job manager.
-
-    Attributes:
-        url: The job manager base URL.
-    """
-
-    url: AnyHttpUrl
-
-    @classmethod
-    def from_charm(cls, charm: CharmBase) -> "JobManagerConfig | None":
-        """Initialize the config from charm.
-
-        Args:
-            charm: The charm instance.
-
-        Returns:
-            Current job manager config of the charm.
-
-        Raises:
-            CharmConfigInvalidError: If an invalid configuration was set.
-        """
-        url_str = cast(str, charm.config.get(PATH_CONFIG_NAME, ""))
-        if not url_str:
-            raise CharmConfigInvalidError(f"Missing {PATH_CONFIG_NAME} configuration")
-
-        try:
-            # pydantic allows string to be passed as AnyHttpUrl, mypy complains about it
-            return cls(url=url_str)  # type: ignore
-        except ValidationError as e:
-            logger.info("Path is not a URL, will not use it as jobmanager url: %s", e)
-        return None
-
-
-class Arch(str, Enum):
-    """Supported system architectures.
-
-    Attributes:
-        ARM64: Represents an ARM64 system architecture.
-        X64: Represents an X64/AMD64 system architecture.
-    """
-
-    ARM64 = "arm64"
-    X64 = "x64"
 
 
 class CharmConfigInvalidError(Exception):
@@ -192,21 +186,6 @@ class CharmConfigInvalidError(Exception):
             msg: Explanation of the error.
         """
         self.msg = msg
-
-
-def _valid_storage_size_str(size: str) -> bool:
-    """Validate the storage size string.
-
-    Args:
-        size: Storage size string.
-
-    Return:
-        Whether the string is valid.
-    """
-    # Checks whether the string confirms to using the KiB, MiB, GiB, TiB, PiB,
-    # EiB suffix for storage size as specified in config.yaml.
-    valid_suffixes = {"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
-    return size[-3:] in valid_suffixes and size[:-3].isdigit()
 
 
 WORD_ONLY_REGEX = re.compile("^[\\w\\-]+$")
@@ -241,120 +220,43 @@ def _parse_labels(labels: str) -> tuple[str, ...]:
     return tuple(valid_labels)
 
 
-class RepoPolicyComplianceConfig(BaseModel):
-    """Configuration for the repo policy compliance service.
-
-    Attributes:
-        token: Token for the repo policy compliance service.
-        url: URL of the repo policy compliance service.
-    """
-
-    token: str
-    url: AnyHttpUrl
-
-    @classmethod
-    def from_charm(cls, charm: CharmBase) -> "RepoPolicyComplianceConfig":
-        """Initialize the config from charm.
-
-        Args:
-            charm: The charm instance.
-
-        Raises:
-            CharmConfigInvalidError: If an invalid configuration was set.
-
-        Returns:
-            Current repo-policy-compliance config.
-        """
-        token = charm.config.get(REPO_POLICY_COMPLIANCE_TOKEN_CONFIG_NAME)
-        if not token:
-            raise CharmConfigInvalidError(
-                f"Missing {REPO_POLICY_COMPLIANCE_TOKEN_CONFIG_NAME} configuration"
-            )
-        url = charm.config.get(REPO_POLICY_COMPLIANCE_URL_CONFIG_NAME)
-        if not url:
-            raise CharmConfigInvalidError(
-                f"Missing {REPO_POLICY_COMPLIANCE_URL_CONFIG_NAME} configuration"
-            )
-
-        # pydantic allows string to be passed as AnyHttpUrl, mypy complains about it
-        return cls(url=url, token=token)  # type: ignore
-
-
-class _OpenStackAuth(TypedDict):
-    """The OpenStack cloud connection authentication info.
-
-    Attributes:
-        auth_url: The OpenStack authentication URL (keystone).
-        password: The OpenStack project user's password.
-        project_domain_name: The project domain in which the project belongs to.
-        project_name: The OpenStack project to connect to.
-        user_domain_name: The user domain in which the user belongs to.
-        username: The user to authenticate as.
-    """
-
-    auth_url: str
-    password: str
-    project_domain_name: str
-    project_name: str
-    user_domain_name: str
-    username: str
-
-
-class _OpenStackCloud(TypedDict):
-    """The OpenStack cloud connection info.
-
-    See https://docs.openstack.org/python-openstackclient/pike/configuration/index.html.
-
-    Attributes:
-        auth: The connection authentication info.
-        region_name: The OpenStack region to authenticate to.
-    """
-
-    auth: _OpenStackAuth
-    region_name: str
-
-
-class OpenStackCloudsYAML(TypedDict):
-    """The OpenStack clouds YAML dict mapping.
-
-    Attributes:
-        clouds: The map of cloud name to cloud connection info.
-    """
-
-    clouds: dict[str, _OpenStackCloud]
-
-
 class CharmConfig(BaseModel):
     """General charm configuration.
 
     Some charm configurations are grouped into other configuration models.
 
     Attributes:
+        allow_external_contributor: Whether to allow runs from forked repositories with from
+            an external contributor with author association status less than COLLABORATOR. See \
+            https://docs.github.com/en/graphql/reference/enums#commentauthorassociation.
         dockerhub_mirror: Private docker registry as dockerhub mirror for the runners to use.
         labels: Additional runner labels to append to default (i.e. os, flavor, architecture).
         openstack_clouds_yaml: The openstack clouds.yaml configuration.
         path: GitHub repository path in the format '<owner>/<repo>', or the GitHub organization
             name.
         reconcile_interval: Time between each reconciliation of runners in minutes.
-        repo_policy_compliance: Configuration for the repo policy compliance service.
         token: GitHub personal access token for GitHub API.
         manager_proxy_command: ProxyCommand for the SSH connection from the manager to the runner.
         use_aproxy: Whether to use aproxy in the runner.
+        aproxy_exclude_addresses: a list of addresses to exclude from the aproxy proxy.
+        aproxy_redirect_ports: a list of ports to redirect to the aproxy proxy.
         custom_pre_job_script: Custom pre-job script to run before the job.
-        jobmanager_url: Base URL of the job manager service.
+        runner_manager_log_level: The log level of the runner manager application.
     """
 
+    allow_external_contributor: bool
     dockerhub_mirror: AnyHttpsUrl | None
     labels: tuple[str, ...]
     openstack_clouds_yaml: OpenStackCloudsYAML
     path: GitHubPath | None
     reconcile_interval: int
-    repo_policy_compliance: RepoPolicyComplianceConfig | None
     token: str | None
     manager_proxy_command: str | None
     use_aproxy: bool
+    aproxy_exclude_addresses: list[str] = []
+    aproxy_redirect_ports: list[str] = []
     custom_pre_job_script: str | None
-    jobmanager_url: AnyHttpUrl | None
+    runner_manager_log_level: LogLevel
 
     @classmethod
     def _parse_dockerhub_mirror(cls, charm: CharmBase) -> str | None:
@@ -450,6 +352,127 @@ class CharmConfig(BaseModel):
 
         return reconcile_interval
 
+    @staticmethod
+    def _parse_list(input_: str | list[str] | None) -> list[str]:
+        """Split a comma-separated list of strings into a list of strings.
+
+        Args:
+            input_: The comma-separated list of strings.
+
+        Returns:
+            A list of strings.
+        """
+        if input_ is None:
+            return []
+        if isinstance(input_, str):
+            input_ = input_.split(",")
+        return [i.strip() for i in input_ if i.strip()]
+
+    @validator("aproxy_exclude_addresses", pre=True)
+    @classmethod
+    def check_aproxy_exclude_addresses(
+        cls, aproxy_exclude_addresses: list[str] | str | None
+    ) -> list[str]:
+        """Parse and validate aproxy_exclude_addresses config value.
+
+        Args:
+            aproxy_exclude_addresses: The aproxy_exclude_addresses configuration input.
+
+        Raises:
+            CharmConfigInvalidError: invalid aproxy_exclude_addresses configuration input.
+
+        Returns:
+            Parsed aproxy_exclude_addresses configuration input.
+        """
+        aproxy_exclude_addresses = cls._parse_list(aproxy_exclude_addresses)
+        result = []
+        for address_range in aproxy_exclude_addresses:
+            if not address_range:
+                continue
+            if "-" in address_range:
+                start, _, end = address_range.partition("-")
+                if not start:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME} config, "
+                        f"in {repr(address_range)}, missing start in range"
+                    )
+                if not end:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME} config, "
+                        f"in {repr(address_range)}, missing end in range"
+                    )
+                try:
+                    ipaddress.ip_address(start)
+                    ipaddress.ip_address(end)
+                except ValueError as exc:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME} config, "
+                        f"in {repr(address_range)}, not an IP address"
+                    ) from exc
+            else:
+                try:
+                    ipaddress.ip_network(address_range, strict=False)
+                except ValueError as exc:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME} config"
+                        f"in {repr(address_range)}, not an IP address"
+                    ) from exc
+            result.append(address_range)
+        return result
+
+    @validator("aproxy_redirect_ports", pre=True)
+    @classmethod
+    def check_aproxy_redirect_ports(
+        cls, aproxy_redirect_ports: list[str] | str | None
+    ) -> list[str]:
+        """Parse and validate check_aproxy_redirect_ports config value.
+
+        Args:
+            aproxy_redirect_ports: The aproxy_exclude_addresses configuration input.
+
+        Raises:
+            CharmConfigInvalidError: invalid check_aproxy_redirect_ports configuration input.
+
+        Returns:
+            Parsed check_aproxy_redirect_ports configuration input.
+        """
+        aproxy_redirect_ports = cls._parse_list(aproxy_redirect_ports)
+        result = []
+        for port_range in aproxy_redirect_ports:
+            if "-" in port_range:
+                start, _, end = port_range.partition("-")
+                if not start:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_REDIRECT_PORTS_CONFIG_NAME} config, "
+                        f"in {repr(port_range)}, missing start in range"
+                    )
+                if not end:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_REDIRECT_PORTS_CONFIG_NAME} config, "
+                        f"in {repr(port_range)}, missing end in range"
+                    )
+                try:
+                    start_num = int(start)
+                    end_num = int(end)
+                except ValueError as exc:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_REDIRECT_PORTS_CONFIG_NAME} config, "
+                        f"in {repr(port_range)}, not a number"
+                    ) from exc
+                if start_num < 0 or start_num > 65535 or end_num < 0 or end_num > 65535:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_REDIRECT_PORTS_CONFIG_NAME} config, "
+                        f"in {repr(port_range)}, invalid port number"
+                    )
+            else:
+                if not port_range.isdecimal() or int(port_range) < 0 or int(port_range) > 65535:
+                    raise CharmConfigInvalidError(
+                        f"Invalid {APROXY_REDIRECT_PORTS_CONFIG_NAME} config,"
+                        f"in {repr(port_range)}, port is not a number or invalid port number"
+                    )
+            result.append(port_range)
+        return result
+
     @classmethod
     def from_charm(cls, charm: CharmBase) -> "CharmConfig":
         """Initialize the config from charm.
@@ -468,8 +491,6 @@ class CharmConfig(BaseModel):
         except CharmConfigInvalidError as exc:
             raise CharmConfigInvalidError(f"Invalid Github config, {str(exc)}") from exc
 
-        jobmanager_config = JobManagerConfig.from_charm(charm) if not github_config else None
-
         try:
             reconcile_interval = int(charm.config[RECONCILE_INTERVAL_CONFIG_NAME])
         except ValueError as err:
@@ -485,37 +506,39 @@ class CharmConfig(BaseModel):
         except ValueError as exc:
             raise CharmConfigInvalidError(f"Invalid {LABELS_CONFIG_NAME} config: {exc}") from exc
 
-        repo_policy_compliance = None
-        if charm.config.get(REPO_POLICY_COMPLIANCE_TOKEN_CONFIG_NAME) or charm.config.get(
-            REPO_POLICY_COMPLIANCE_URL_CONFIG_NAME
-        ):
-            if not openstack_clouds_yaml:
-                raise CharmConfigInvalidError(
-                    "Cannot use repo-policy-compliance config without using OpenStack."
-                )
-            repo_policy_compliance = RepoPolicyComplianceConfig.from_charm(charm)
-
         manager_proxy_command = (
             cast(str, charm.config.get(MANAGER_SSH_PROXY_COMMAND_CONFIG_NAME, "")) or None
         )
-        use_aproxy = bool(charm.config.get(USE_APROXY_CONFIG_NAME))
+        use_aproxy = cast(bool, charm.config.get(USE_APROXY_CONFIG_NAME, False))
 
         custom_pre_job_script = (
             cast(str, charm.config.get(CUSTOM_PRE_JOB_SCRIPT_CONFIG_NAME, "")) or None
         )
-        # pydantic allows to pass str as AnyHttpUrl, mypy complains about it
+
+        runner_manager_log_level = cast(
+            LogLevel, charm.config.get(RUNNER_MANAGER_LOG_LEVEL_CONFIG_NAME, "INFO")
+        )
         return cls(
+            allow_external_contributor=cast(
+                bool, charm.config.get(ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME, False)
+            ),
             dockerhub_mirror=dockerhub_mirror,  # type: ignore
             labels=labels,
             openstack_clouds_yaml=openstack_clouds_yaml,
             path=github_config.path if github_config else None,
             reconcile_interval=reconcile_interval,
-            repo_policy_compliance=repo_policy_compliance,
             token=github_config.token if github_config else None,
             manager_proxy_command=manager_proxy_command,
             use_aproxy=use_aproxy,
+            # mypy doesn't know about the validator
+            aproxy_exclude_addresses=charm.config.get(  # type: ignore
+                APROXY_EXCLUDE_ADDRESSES_CONFIG_NAME
+            ),
+            aproxy_redirect_ports=charm.config.get(  # type: ignore
+                APROXY_REDIRECT_PORTS_CONFIG_NAME
+            ),
             custom_pre_job_script=custom_pre_job_script,
-            jobmanager_url=jobmanager_config.url if jobmanager_config else None,
+            runner_manager_log_level=runner_manager_log_level,
         )
 
 
@@ -555,20 +578,6 @@ class OpenstackImage(BaseModel):
                 tags=[tag.strip() for tag in relation_data.get("tags", "").split(",") if tag],
             )
         return OpenstackImage(id=None, tags=None)
-
-
-@dataclasses.dataclass
-class FlavorLabel:
-    """Combination of flavor and label.
-
-    Attributes:
-        flavor: Flavor for the VM.
-        label: Label associated with the flavor.
-    """
-
-    flavor: str
-    # Remove the None when several FlavorLabel combinations are supported.
-    label: str | None
 
 
 class OpenstackRunnerConfig(BaseModel):
@@ -615,6 +624,12 @@ class OpenstackRunnerConfig(BaseModel):
             raise CharmConfigInvalidError(
                 "Invalid configuration. "
                 "Both deprecated and new configuration are set for the number of machines to spawn."
+            )
+
+        if 0 < max_total_virtual_machines < base_virtual_machines:
+            raise CharmConfigInvalidError(
+                f"max-total-virtual-machines ({max_total_virtual_machines})"
+                f" must be >= base-virtual-machines ({base_virtual_machines})"
             )
 
         flavor_label_config = cast(str, charm.config[FLAVOR_LABEL_COMBINATIONS_CONFIG_NAME])
@@ -669,41 +684,6 @@ def _build_runner_proxy_config_from_charm(charm: CharmBase) -> "ProxyConfig":
     return build_proxy_config_from_charm()
 
 
-class UnsupportedArchitectureError(Exception):
-    """Raised when given machine charm architecture is unsupported.
-
-    Attributes:
-        arch: The current machine architecture.
-    """
-
-    def __init__(self, arch: str) -> None:
-        """Initialize a new instance of the CharmConfigInvalidError exception.
-
-        Args:
-            arch: The current machine architecture.
-        """
-        self.arch = arch
-
-
-def _get_supported_arch() -> Arch:
-    """Get current machine architecture.
-
-    Raises:
-        UnsupportedArchitectureError: if the current architecture is unsupported.
-
-    Returns:
-        Arch: Current machine architecture.
-    """
-    arch = platform.machine()
-    match arch:
-        case arch if arch in ARCHITECTURES_ARM64:
-            return Arch.ARM64
-        case arch if arch in ARCHITECTURES_X86:
-            return Arch.X64
-        case _:
-            raise UnsupportedArchitectureError(arch=arch)
-
-
 def _build_ssh_debug_connection_from_charm(charm: CharmBase) -> list[SSHDebugConnection]:
     """Initialize the SSHDebugInfo from charm relation data.
 
@@ -744,6 +724,50 @@ def _build_ssh_debug_connection_from_charm(charm: CharmBase) -> list[SSHDebugCon
             )
         )
     return ssh_debug_connections
+
+
+def _build_planner_config_from_charm(charm: CharmBase) -> PlannerConfig | None:
+    """Initialize planner endpoint and token from relation data.
+
+    Args:
+        charm: The charm instance.
+
+    Returns:
+        PlannerConfig if planner relation data is ready; otherwise None.
+    """
+    relations = charm.model.relations[PLANNER_INTEGRATION_NAME]
+    if not relations or not (relation := relations[0]).app:
+        return None
+
+    relation_data = relation.data[relation.app]
+    if not (endpoint := relation_data.get("endpoint")) or not (
+        token_secret_id := relation_data.get("token")
+    ):
+        logger.warning(
+            "%s relation data for %s not yet ready.", PLANNER_INTEGRATION_NAME, relation.app
+        )
+        return None
+    try:
+        token_secret = charm.model.get_secret(id=token_secret_id)
+        # no need for refresh - there shouldn't be multiple secret revisions
+        token_content = token_secret.get_content()
+        token = token_content.get("token")
+        if not token:
+            logger.warning(
+                "Token secret content for %s relation app %s is missing token field.",
+                PLANNER_INTEGRATION_NAME,
+                relation.app,
+            )
+            return None
+        return PlannerConfig(endpoint=endpoint, token=token)
+    except SecretNotFoundError:
+        logger.warning(
+            "Token secret %s for %s relation app %s is not found or not granted yet.",
+            token_secret_id,
+            PLANNER_INTEGRATION_NAME,
+            relation.app,
+        )
+    return None
 
 
 class ReactiveConfig(BaseModel):
@@ -796,7 +820,6 @@ class CharmState:  # pylint: disable=too-many-instance-attributes
     """The charm state.
 
     Attributes:
-        arch: The underlying compute architecture, i.e. x86_64, amd64, arm64/aarch64.
         charm_config: Configuration of the juju charm.
         is_metrics_logging_available: Whether the charm is able to issue metrics.
         proxy_config: Proxy-related configuration.
@@ -804,9 +827,9 @@ class CharmState:  # pylint: disable=too-many-instance-attributes
         reactive_config: The charm configuration related to reactive spawning mode.
         runner_config: The charm configuration related to runner VM configuration.
         ssh_debug_connections: SSH debug connections configuration information.
+        planner_config: Planner endpoint and token from relation data.
     """
 
-    arch: Arch
     is_metrics_logging_available: bool
     proxy_config: ProxyConfig
     runner_proxy_config: ProxyConfig
@@ -814,6 +837,7 @@ class CharmState:  # pylint: disable=too-many-instance-attributes
     runner_config: OpenstackRunnerConfig
     reactive_config: ReactiveConfig | None
     ssh_debug_connections: list[SSHDebugConnection]
+    planner_config: PlannerConfig | None
 
     @classmethod
     def _store_state(cls, state: "CharmState") -> None:
@@ -908,21 +932,15 @@ class CharmState:  # pylint: disable=too-many-instance-attributes
             charm_config.labels = (flavor_label_combination.label,) + charm_config.labels
 
         try:
-            arch = _get_supported_arch()
-        except UnsupportedArchitectureError as exc:
-            logger.error("Unsupported architecture: %s", exc.arch)
-            raise CharmConfigInvalidError(f"Unsupported architecture {exc.arch}") from exc
-
-        try:
             ssh_debug_connections = _build_ssh_debug_connection_from_charm(charm)
         except ValidationError as exc:
             logger.error("Invalid SSH debug info: %s.", exc)
             raise CharmConfigInvalidError("Invalid SSH Debug info") from exc
 
+        planner_config = _build_planner_config_from_charm(charm)
         reactive_config = ReactiveConfig.from_database(database)
 
         state = cls(
-            arch=arch,
             is_metrics_logging_available=bool(charm.model.relations[COS_AGENT_INTEGRATION_NAME]),
             proxy_config=proxy_config,
             runner_proxy_config=runner_proxy_config,
@@ -930,6 +948,7 @@ class CharmState:  # pylint: disable=too-many-instance-attributes
             runner_config=runner_config,
             reactive_config=reactive_config,
             ssh_debug_connections=ssh_debug_connections,
+            planner_config=planner_config,
         )
 
         cls._store_state(state)

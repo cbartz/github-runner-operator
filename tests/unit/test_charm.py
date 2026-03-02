@@ -1,7 +1,8 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Test cases for GithubRunnerCharm."""
+
 import os
 import secrets
 import typing
@@ -28,13 +29,21 @@ from charm import (
 from charm_state import (
     FLAVOR_LABEL_COMBINATIONS_CONFIG_NAME,
     IMAGE_INTEGRATION_NAME,
+    LABELS_CONFIG_NAME,
     MONGO_DB_INTEGRATION_NAME,
     OPENSTACK_CLOUDS_YAML_CONFIG_NAME,
     OPENSTACK_FLAVOR_CONFIG_NAME,
     PATH_CONFIG_NAME,
+    PLANNER_DEFAULT_PLATFORM,
+    PLANNER_DEFAULT_PRIORITY,
+    PLANNER_FLAVOR_RELATION_KEY,
+    PLANNER_INTEGRATION_NAME,
+    PLANNER_LABELS_RELATION_KEY,
+    PLANNER_MINIMUM_PRESSURE_RELATION_KEY,
+    PLANNER_PLATFORM_RELATION_KEY,
+    PLANNER_PRIORITY_RELATION_KEY,
     TOKEN_CONFIG_NAME,
     USE_APROXY_CONFIG_NAME,
-    Arch,
     OpenStackCloudsYAML,
     OpenstackImage,
 )
@@ -59,9 +68,6 @@ def side_effect_fixture(monkeypatch, tmpdir):
     monkeypatch.setattr("charm.execute_command", MagicMock())
     monkeypatch.setattr("charm.systemd", MagicMock())
     monkeypatch.setattr("manager_service.yaml_safe_dump", MagicMock())
-    monkeypatch.setattr("manager_service.Path.expanduser", lambda x: tmpdir)
-    monkeypatch.setattr("manager_service.Path.mkdir", MagicMock())
-    monkeypatch.setattr("manager_service.Path.touch", MagicMock())
     monkeypatch.setattr("manager_service.systemd", MagicMock())
 
 
@@ -111,12 +117,11 @@ def raise_url_error(*args, **kwargs):
     raise urllib.error.URLError("mock error")
 
 
-def mock_get_latest_runner_bin_url(os_name: str = "linux", arch: Arch = Arch.X64):
+def mock_get_latest_runner_bin_url(os_name: str = "linux"):
     """Stub function to return test runner_bin_url data.
 
     Args:
         os_name: OS name placeholder argument.
-        arch: Architecture placeholder argument.
 
     Returns:
         MagicMock runner application.
@@ -223,7 +228,10 @@ def test_common_install_code(
     """
     state_mock = MagicMock()
     harness.charm._setup_state = MagicMock(return_value=state_mock)
-
+    manager_client_mock = MagicMock(spec=GitHubRunnerManagerClient)
+    harness.charm._manager_client = manager_client_mock
+    mock_manager_service = MagicMock()
+    monkeypatch.setattr("charm.manager_service", mock_manager_service)
     monkeypatch.setattr("charm.logrotate.setup", setup_logrotate := MagicMock())
     monkeypatch.setattr("charm.systemd", MagicMock())
 
@@ -242,6 +250,63 @@ def test_on_config_changed_failure(harness: Harness):
 
     assert isinstance(harness.charm.unit.status, BlockedStatus)
     assert "Invalid proxy configuration" in harness.charm.unit.status.message
+
+
+@pytest.mark.parametrize(
+    "config_option",
+    [
+        pytest.param(PATH_CONFIG_NAME, id="Path"),
+        pytest.param(TOKEN_CONFIG_NAME, id="Token"),
+        pytest.param(LABELS_CONFIG_NAME, id="Labels"),
+    ],
+)
+def test__on_config_changed_flush(monkeypatch: pytest.MonkeyPatch, config_option: str):
+    """
+    arrange: given a charm with OpenStack instance type and a certain config option value.
+    act: update the config option.
+    assert: runner flush is called.
+    """
+    harness = Harness(GithubRunnerCharm)
+    harness.update_config({config_option: secrets.token_hex(16)})
+    harness.begin()
+    state_mock = MagicMock()
+    monkeypatch.setattr("charm.manager_service", MagicMock())
+    harness.charm._manager_client = MagicMock(spec=GitHubRunnerManagerClient)
+    harness.charm._setup_state = MagicMock(return_value=state_mock)
+    harness.charm._check_image_ready = MagicMock(return_value=True)
+
+    harness.update_config({config_option: secrets.token_hex(16)})
+
+    harness.charm._manager_client.flush_runner.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "config_option",
+    [
+        pytest.param(PATH_CONFIG_NAME, id="Path"),
+        pytest.param(TOKEN_CONFIG_NAME, id="Token"),
+        pytest.param(LABELS_CONFIG_NAME, id="Labels"),
+    ],
+)
+def test__on_config_changed_no_flush(monkeypatch: pytest.MonkeyPatch, config_option: str):
+    """
+    arrange: given a charm with OpenStack instance type and a certain config option value.
+    act: update the config option to be the same as before.
+    assert: runner flush is called.
+    """
+    config_option_val = secrets.token_hex(16)
+    harness = Harness(GithubRunnerCharm)
+    harness.update_config({config_option: config_option_val})
+    harness.begin()
+    state_mock = MagicMock()
+    monkeypatch.setattr("charm.manager_service", MagicMock())
+    harness.charm._manager_client = MagicMock(spec=GitHubRunnerManagerClient)
+    harness.charm._setup_state = MagicMock(return_value=state_mock)
+    harness.charm._check_image_ready = MagicMock(return_value=True)
+
+    harness.update_config({config_option: config_option_val})
+
+    harness.charm._manager_client.flush_runner.assert_not_called()
 
 
 def test_on_stop_busy_flush_and_stop_service(harness: Harness, monkeypatch: pytest.MonkeyPatch):
@@ -574,6 +639,10 @@ def test_metric_log_ownership_for_upgrade(
 
     mock_metric_log_path = tmp_path
     mock_metric_log_path.touch(exist_ok=True)
+    manager_client_mock = MagicMock(spec=GitHubRunnerManagerClient)
+    harness.charm._manager_client = manager_client_mock
+    mock_manager_service = MagicMock()
+    monkeypatch.setattr("charm.manager_service", mock_manager_service)
     monkeypatch.setattr("charm.METRICS_LOG_PATH", mock_metric_log_path)
     monkeypatch.setattr("charm.shutil", shutil_mock := MagicMock())
     monkeypatch.setattr("charm.execute_command", MagicMock(return_value=(0, "Mock_stdout")))
@@ -596,6 +665,10 @@ def test_attempting_disable_legacy_service_for_upgrade(
     assert: Calls to stop the legacy service is performed.
     """
     harness.charm._setup_state = MagicMock()
+    manager_client_mock = MagicMock(spec=GitHubRunnerManagerClient)
+    harness.charm._manager_client = manager_client_mock
+    mock_manager_service = MagicMock()
+    monkeypatch.setattr("charm.manager_service", mock_manager_service)
     monkeypatch.setattr("charm.systemd", mock_systemd := MagicMock())
     monkeypatch.setattr("charm.execute_command", MagicMock(return_value=(0, "Mock_stdout")))
     monkeypatch.setattr("charm.pathlib", MagicMock())
@@ -638,3 +711,34 @@ def test_database_integration_events_setup_service(
     else:
         getattr(harness.charm.database.on, hook).emit(relation=relation_mock)
     setup_service_mock.assert_called_once()
+
+
+def test_planner_relation_changed_writes_flavor(monkeypatch: pytest.MonkeyPatch):
+    """
+    arrange: Set up charm with mocked _setup_state and _setup_service.
+    act: Fire planner relation_changed event.
+    assert: The app data bag contains all flavor fields for the planner.
+    """
+    harness = Harness(GithubRunnerCharm)
+    harness.set_leader(True)
+    relation_id = harness.add_relation(PLANNER_INTEGRATION_NAME, "planner-app")
+    harness.add_relation_unit(relation_id, "planner-app/0")
+    harness.begin()
+    monkeypatch.setattr("charm.manager_service", MagicMock())
+    state_mock = MagicMock()
+    state_mock.charm_config.labels = ("label1", "label2")
+    state_mock.runner_config.base_virtual_machines = 3
+    state_mock.runner_config.openstack_image.id = "image-id"
+    state_mock.runner_config.openstack_image.tags = ["x64", "noble"]
+    harness.charm._setup_state = MagicMock(return_value=state_mock)
+    harness.charm._setup_service = MagicMock()
+
+    harness.update_relation_data(relation_id, "planner-app/0", {"endpoint": "http://example.com"})
+
+    assert harness.get_relation_data(relation_id, harness.charm.app) == {
+        PLANNER_FLAVOR_RELATION_KEY: harness.charm.app.name,
+        PLANNER_LABELS_RELATION_KEY: '["label1", "label2", "x64", "noble"]',
+        PLANNER_PLATFORM_RELATION_KEY: PLANNER_DEFAULT_PLATFORM,
+        PLANNER_PRIORITY_RELATION_KEY: str(PLANNER_DEFAULT_PRIORITY),
+        PLANNER_MINIMUM_PRESSURE_RELATION_KEY: "3",
+    }

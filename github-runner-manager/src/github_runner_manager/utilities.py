@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Utilities used by the charm."""
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 # Parameters of the function decorated with retry
-ParamT = ParamSpec("ParamT")
+ParamT = ParamSpec("ParamT")  # pylint: disable=invalid-name
 # Return type of the function decorated with retry
 ReturnT = TypeVar("ReturnT")
 

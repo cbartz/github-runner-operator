@@ -1,8 +1,9 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Fixtures for github runner charm."""
 
+import os
 
 from pytest import Parser
 
@@ -25,12 +26,22 @@ def pytest_addoption(parser: Parser):
             "An optionally comma separated GitHub Personal Access Token(s). "
             "Add more than one to help reduce rate limiting."
         ),
+        default=os.environ.get("INTEGRATION_TOKEN"),
     )
     parser.addoption(
-        "--charm-file", action="store", help="The prebuilt github-runner-operator charm file."
+        "--charm-file",
+        action="append",
+        help="The prebuilt github-runner-operator charm file.",
+        default=[],
     )
     parser.addoption(
-        "--token-alt", action="store", help="An alternative token to test the change of a token."
+        "--base",
+        action="store",
+        default="22.04",
+        help=(
+            "Ubuntu base token (e.g., 22.04, 24.04). Used to select the matching charm"
+            " artifact when multiple --charm-file values are provided."
+        ),
     )
     parser.addoption(
         "--http-proxy",
@@ -46,12 +57,6 @@ def pytest_addoption(parser: Parser):
         "--no-proxy",
         action="store",
         help="No proxy configuration value for juju model proxy configuration.",
-    )
-    parser.addoption(
-        "--openstack-clouds-yaml",
-        action="store",
-        help="The OpenStack clouds yaml file for the charm to use.",
-        default="",
     )
     parser.addoption(
         "--use-existing-app-suffix",
@@ -83,95 +88,57 @@ def pytest_addoption(parser: Parser):
     )
     # Private endpoint options AMD64
     parser.addoption(
-        "--openstack-network-name-amd64",
+        "--openstack-network-name",
         action="store",
         help="The Openstack network to create testing instances under.",
+        default=os.environ.get("OS_NETWORK"),
     )
     parser.addoption(
-        "--openstack-flavor-name-amd64",
+        "--openstack-flavor-name",
         action="store",
         help="The Openstack flavor to create testing instances with.",
     )
     parser.addoption(
-        "--openstack-auth-url-amd64",
+        "--openstack-auth-url",
         action="store",
         help="The URL to Openstack authentication service, i.e. keystone.",
+        default=os.environ.get("OS_AUTH_URL"),
     )
     parser.addoption(
-        "--openstack-password-amd64",
+        "--openstack-password",
         action="store",
         help="The password to authenticate to Openstack service.",
+        default=os.environ.get("OS_PASSWORD"),
     )
     parser.addoption(
-        "--openstack-project-domain-name-amd64",
+        "--openstack-project-domain-name",
         action="store",
         help="The Openstack project domain name to use.",
+        default=os.environ.get("OS_PROJECT_DOMAIN_NAME"),
     )
     parser.addoption(
-        "--openstack-project-name-amd64",
+        "--openstack-project-name",
         action="store",
         help="The Openstack project name to use.",
+        default=os.environ.get("OS_PROJECT_NAME"),
     )
     parser.addoption(
-        "--openstack-user-domain-name-amd64",
+        "--openstack-user-domain-name",
         action="store",
         help="The Openstack user domain name to use.",
+        default=os.environ.get("OS_USER_DOMAIN_NAME"),
     )
     parser.addoption(
-        "--openstack-username-amd64",
+        "--openstack-username",
         action="store",
         help="The Openstack user to authenticate as.",
+        default=os.environ.get("OS_USERNAME"),
     )
     parser.addoption(
-        "--openstack-region-name-amd64",
+        "--openstack-region-name",
         action="store",
         help="The Openstack region to authenticate to.",
-    )
-    # Private endpoint options ARM64
-    parser.addoption(
-        "--openstack-network-name-arm64",
-        action="store",
-        help="The Openstack network to create testing instances under.",
-    )
-    parser.addoption(
-        "--openstack-flavor-name-arm64",
-        action="store",
-        help="The Openstack flavor to create testing instances with.",
-    )
-    parser.addoption(
-        "--openstack-auth-url-arm64",
-        action="store",
-        help="The URL to Openstack authentication service, i.e. keystone.",
-    )
-    parser.addoption(
-        "--openstack-password-arm64",
-        action="store",
-        help="The password to authenticate to Openstack service.",
-    )
-    parser.addoption(
-        "--openstack-project-domain-name-arm64",
-        action="store",
-        help="The Openstack project domain name to use.",
-    )
-    parser.addoption(
-        "--openstack-project-name-arm64",
-        action="store",
-        help="The Openstack project name to use.",
-    )
-    parser.addoption(
-        "--openstack-user-domain-name-arm64",
-        action="store",
-        help="The Openstack user domain name to use.",
-    )
-    parser.addoption(
-        "--openstack-username-arm64",
-        action="store",
-        help="The Openstack user to authenticate as.",
-    )
-    parser.addoption(
-        "--openstack-region-name-arm64",
-        action="store",
-        help="The Openstack region to authenticate to.",
+        default=os.environ.get("OS_REGION_NAME"),
     )
     # Interface testing args
     parser.addoption(
@@ -184,5 +151,18 @@ def pytest_addoption(parser: Parser):
         "--openstack-test-flavor",
         action="store",
         help="The flavor for testing openstack interfaces. The resource should be enough to boot the test image.",
+        default=None,
+    )
+    parser.addoption(
+        "--openstack-image-id",
+        action="store",
+        help="The image ID to use for testing. If provided, any-charm will be used to mock the "
+        "image builder for faster testing deployment.",
+        default=None,
+    )
+    parser.addoption(
+        "--dockerhub-mirror",
+        action="store",
+        help="The DockerHub mirror URL to use for testing.",
         default=None,
     )

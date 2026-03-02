@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 [tool.bandit]
@@ -9,11 +9,7 @@ skips = ["*/*test.py", "*/test_*.py", "*tests/*.py"]
 # Testing tools configuration
 [tool.coverage.run]
 branch = true
-omit = [
-    # Contains interface for calling repo policy compliance service. Tested in integration test
-    # and end to end tests.
-    "src/repo_policy_compliance_client.py",
-]
+omit = []
 
 [tool.coverage.report]
 fail_under = 83
@@ -27,6 +23,7 @@ markers = [
 ]
 
 [tool.pylint.'MESSAGES CONTROL']
+good-names = ["ParamT", "ReturnT"]
 # see https://github.com/pydantic/pydantic/issues/1961#issuecomment-759522422
 extension-pkg-whitelist = "pydantic"
 # Ignore W0511 TODO comments because the functions are subject to refactor.

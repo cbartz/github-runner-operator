@@ -21,115 +21,114 @@ jq -n \
   }' > "{{ metrics_exchange_path }}/pre-job-metrics.json" || true
 {% endif %}
 
-{% if do_repo_policy_check %}
+{% if not allow_external_contributor %}
+  # Check author association for events that can be triggered by external contributors
+  # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+  # This does not cover all possible events, only the most common ones that can be triggered by external contributors.
+  
+  check_author_association() {
+    local event_name="$1"
+    local event_path="$2"
 
-    # Log common env variables.
-    logger -s "GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME}, \
-      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY}, \
-      GITHUB_SHA: ${GITHUB_SHA}"
-
-    # Prepare curl arguments
-    CURL_ARGS=(
-      --silent
-      --show-error
-      --max-time 60
-      --noproxy '*'
-      --fail-with-body
-      -o repo_check_output.txt
-      --stderr repo_check_error.txt
-      --write-out "%{http_code}"
-      -H 'Authorization: Bearer {{repo_policy_one_time_token}}'
-      -H 'Content-Type: application/json'
-    )
-
-    # Set REPO_CHECK to a failure code as a safe guard.
-    REPO_CHECK=1
-
-    # Special Workflow dispatch repo-policy-compliance service check designed to fail:
-    if [[ "${GITHUB_WORKFLOW}" == "Workflow Dispatch Failure Tests 2a34f8b1-41e4-4bcb-9bbf-7a74e6c482f7" ]]; then
-      logger -s "Running the test workflow for integration tests, this test is configured to fail"
-
-      REPO_CHECK_HTTP_CODE=$(curl "${CURL_ARGS[@]}" \
-          -X POST \
-          {{repo_policy_base_url}}/always-fail/check-run)
-      REPO_CHECK=$?
-
-    # Pull request - Request repo-policy-compliance service check:
-    elif [[ "${GITHUB_EVENT_NAME}" ==  "pull_request" ]]; then
-
-      GITHUB_SOURCE_REPOSITORY=$(cat "${GITHUB_EVENT_PATH}" | jq -r '.pull_request.head.repo.full_name')
-      COMMIT_SHA=$(cat "${GITHUB_EVENT_PATH}" | jq -r '.pull_request.head.sha')
-
-      logger -s " \
-      GITHUB_SOURCE_REPOSITORY: ${GITHUB_SOURCE_REPOSITORY} \
-      GITHUB_BASE_REF: ${GITHUB_BASE_REF}, \
-      GITHUB_HEAD_REF: ${GITHUB_HEAD_REF}, \
-      COMMIT_SHA: ${COMMIT_SHA}"
-
-      REPO_CHECK_HTTP_CODE=$(curl "${CURL_ARGS[@]}" \
-          -d "{\"repository_name\": \"${GITHUB_REPOSITORY}\", \"source_repository_name\": \"${GITHUB_SOURCE_REPOSITORY}\", \"target_branch_name\": \"${GITHUB_BASE_REF}\", \"source_branch_name\": \"${GITHUB_HEAD_REF}\", \"commit_sha\": \"${COMMIT_SHA}\"}" \
-          {{repo_policy_base_url}}/pull_request/check-run)
-      REPO_CHECK=$?
-
-    else
-      # Workflow dispatch, Push and Schedule use their respective endpoints, all other events use default by default.
-      CHECK_NAME="default"
-      if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]] || [[ "${GITHUB_EVENT_NAME}" == "push" ]] || [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-        CHECK_NAME="${GITHUB_EVENT_NAME}"
+    # Skip check for non-contributor events
+    if [[ "$event_name" != "pull_request" && "$event_name" != "pull_request_target" && 
+          "$event_name" != "pull_request_review" && "$event_name" != "pull_request_review_comment" && 
+          "$event_name" != "issue_comment" ]]; then
+      logger -s "Contributor check skipped for event: $event_name"
+      return 0
+    fi
+    
+    # Helper function to check if author association is allowed
+    # Private repositories allow CONTRIBUTOR in addition to OWNER/MEMBER/COLLABORATOR
+    is_author_allowed() {
+      local author="$1"
+      local ALLOWED_AUTHORIZATIONS=("OWNER" "MEMBER" "COLLABORATOR")
+      
+      # Check if repository is private to determine authorization level
+      local is_private=$(jq -r '.repository.private // false' "$event_path")
+      
+      # Extend allowed authorizations for private repositories
+      if [[ "$is_private" == "true" ]]; then
+        ALLOWED_AUTHORIZATIONS+=("CONTRIBUTOR")
+        logger -s "Private repository - extended authorization includes CONTRIBUTOR"
       fi
-
-      logger -s "GITHUB_REF_NAME: ${GITHUB_REF_NAME}"
-
-      REPO_CHECK_HTTP_CODE=$(curl "${CURL_ARGS[@]}" \
-          -d "{\"repository_name\": \"${GITHUB_REPOSITORY}\"}" \
-          {{repo_policy_base_url}}/${CHECK_NAME}/check-run)
-      REPO_CHECK=$?
-
+      
+      local auth
+      for auth in "${ALLOWED_AUTHORIZATIONS[@]}"; do
+        if [[ "$author" == "$auth" ]]; then
+          return 0
+        fi
+      done
+      return 1
+    }
+    
+    # Handle issue comment events - always check author association
+    if [[ "$event_name" == "issue_comment" ]]; then
+      local author_association=$(jq -r '.comment.author_association // empty' "$event_path")
+      local is_allowed=$(is_author_allowed "$author_association" && echo "true" || echo "false")
+      
+      logger -s "Author association: $author_association, is allowed: $is_allowed"
+      
+      if [[ "$is_allowed" == "false" ]]; then
+        logger -p user.error -s "Insufficient user authorization - only OWNER, MEMBER, or COLLABORATOR may run workflows"
+        return 1
+      fi
+      return 0
     fi
-
-    if [[ $REPO_CHECK -ne 0 ]]; then
-        if [[ -s repo_check_output.txt ]]; then
-            logger -p user.error -s -f repo_check_output.txt
-        fi
-        if [[ -s repo_check_error.txt ]]; then
-            logger -p user.error -s -f repo_check_error.txt
-        fi
-        if [[ $REPO_CHECK_HTTP_CODE -ge 500 ]] && [[ $REPO_CHECK_HTTP_CODE -lt 600 ]]; then
-            logger -p user.error -s "The repository setup check failed with HTTP code ${REPO_CHECK_HTTP_CODE}."
-            logger -p user.error -s "This runner will be stopped or lost, please contact the repo-policy-compliance server operators or try again later."
-        else
-            logger -p user.error -s "Stopping execution of jobs due to repository setup is not compliant with policies."
-            logger -p user.error -s "This runner will be stopped or lost, please fix the setup of the repository, then rerun this job."
-        fi
-
-        # Killing the runner.Listener process to stop the runner application. This will prevent jobs from being executed.
-        pkill -2 Runner.Listener
-
-
-        {% if issue_metrics %}
-            # Write Post Job metrics with status "repo-policy-check-failure" .
-            # We write it here, rather than relying on the post-job script,
-            # as it may not run due to the poweroff command below.
-            post_job_timestamp=$(date +%s)
-
-            jq -n \
-              --argjson timestamp "$post_job_timestamp" \
-              --argjson http_code "$REPO_CHECK_HTTP_CODE" \
-              '{
-                "timestamp": $timestamp,
-                "status": "repo-policy-check-failure",
-                "status_info": {code: $http_code}
-              }' > "{{ metrics_exchange_path }}/post-job-metrics.json" || true
-        {% endif %}
-
-      # Shutdown the instance as a safe guard. The time delay is needed for the runner application to upload the logs.
-      bash -c "sleep 10; sudo systemctl poweroff -i" &
-
-      exit 1
-
+    
+    # Extract PR repository information for PR events
+    local pr_head_repo=$(jq -r '.pull_request.head.repo.full_name // empty' "$event_path")
+    local pr_base_repo=$(jq -r '.pull_request.base.repo.full_name // empty' "$event_path")
+    
+    # Check if this is an internal PR (same repository)
+    local is_internal_pr=$([[ -n "$pr_head_repo" && -n "$pr_base_repo" && "$pr_head_repo" == "$pr_base_repo" ]] && echo true || echo false)
+    logger -s "IS_INTERNAL_PR: $is_internal_pr (head: $pr_head_repo, base: $pr_base_repo)"
+    
+    # Skip check for internal PRs
+    if [[ "$is_internal_pr" == "true" ]]; then
+      logger -s "Internal PR detected - contributor check skipped"
+      return 0
     fi
-
-    logger -s "The repository setup check has passed, proceeding to execute jobs"
+    
+    # Fork PR or missing repository info - perform author association check
+    logger -s "PR HEAD repo: $pr_head_repo, PR BASE repo: $pr_base_repo"
+    logger -s "Fork PR or missing repository detected - performing contributor check"
+    
+    # Get author association from appropriate field based on event type
+    local author_association=""
+    if [[ "$event_name" == "pull_request" || "$event_name" == "pull_request_target" ]]; then
+      author_association=$(jq -r '.pull_request.author_association // empty' "$event_path")
+    elif [[ "$event_name" == "pull_request_review" ]]; then
+      author_association=$(jq -r '.review.author_association // empty' "$event_path")
+    elif [[ "$event_name" == "pull_request_review_comment" ]]; then
+      author_association=$(jq -r '.comment.author_association // empty' "$event_path")
+    fi
+    
+    local is_allowed=$(is_author_allowed "$author_association" && echo "true" || echo "false")
+    logger -s "Author association: $author_association, is allowed: $is_allowed"
+    
+    if [[ "$is_allowed" == "false" ]]; then
+      logger -p user.error -s "Insufficient user authorization - only OWNER, MEMBER, or COLLABORATOR may run workflows"
+      return 1
+    fi
+    
+    return 0
+  }
+  
+  # Perform the author association check
+  check_author_association "$GITHUB_EVENT_NAME" "$GITHUB_EVENT_PATH"
+  if [[ $? -ne 0 ]]; then
+    logger -s "Contributor check failed - aborting job execution"
+    post_job_timestamp=$(date +%s)
+    jq -n \
+        --argjson timestamp "$post_job_timestamp" \
+        '{
+          "timestamp": $timestamp,
+          "status": "external-contributor-check-failure"
+        }' > "{{ metrics_exchange_path }}/post-job-metrics.json" || true
+    exit 1
+  fi
+  logger -s "Contributor check passed - proceeding to execute jobs"
 {% endif %}
 
 if [[ -n "$DOCKERHUB_MIRROR" ]]; then

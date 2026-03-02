@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Module containing the main classes for business logic."""
@@ -32,8 +32,8 @@ class InstanceID:
     """
 
     prefix: str
-    reactive: bool | None
     suffix: str
+    reactive: bool | None = None
 
     @property
     def name(self) -> str:
@@ -163,7 +163,7 @@ class RunnerMetadata:
     platform ones.
 
     Attributes:
-        platform_name: Platform name where the runner resides (github, jobmanager...)
+        platform_name: Platform name where the runner resides (currently only github)
         runner_id: Id of the runner in the platform
         url: URL for the runner.
     """

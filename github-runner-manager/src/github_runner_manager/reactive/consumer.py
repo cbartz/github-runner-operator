@@ -1,10 +1,10 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Module responsible for consuming jobs from the message queue."""
+
 import contextlib
 import logging
-import re
 import signal
 import sys
 from contextlib import closing
@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 Labels = set[str]
 
+PROCESS_COUNT_HEADER_NAME = "X-Process-Count"
+WAIT_TIME_IN_SEC = 60
+RETRY_LIMIT = 5
+# Exponential backoff configuration for message retries
+BACKOFF_BASE_SECONDS = 60
+BACKOFF_MAX_SECONDS = 1800
 # This control message is for testing. The reactive process will stop consuming messages
 # when the message is sent. This message does not come from the router.
 END_PROCESSING_PAYLOAD = "__END__"
@@ -90,6 +96,19 @@ def get_queue_size(queue_config: QueueConfig) -> int:
         raise QueueError("Error when communicating with the queue") from exc
 
 
+def _calculate_backoff_time(retry_count: int) -> int:
+    """Calculate exponential backoff time for retries.
+
+    Args:
+        retry_count: The current retry count (starting from 1).
+
+    Returns:
+        The backoff time in seconds, capped at BACKOFF_MAX_SECONDS.
+    """
+    backoff_time = BACKOFF_BASE_SECONDS * (2 ** (retry_count - 1))
+    return min(backoff_time, BACKOFF_MAX_SECONDS)
+
+
 # Ignore `consume` too complex as it is pending re-design.
 def consume(  # noqa: C901
     queue_config: QueueConfig,
@@ -125,8 +144,34 @@ def consume(  # noqa: C901
                 if msg.payload == END_PROCESSING_PAYLOAD:
                     msg.ack()
                     break
+
+                msg.headers[PROCESS_COUNT_HEADER_NAME] = (
+                    msg.headers.get(PROCESS_COUNT_HEADER_NAME, 0) + 1
+                )
+                msg_process_count = msg.headers[PROCESS_COUNT_HEADER_NAME]
+
                 job_details = _parse_job_details(msg)
                 logger.info("Received reactive job: %s", job_details)
+
+                if msg_process_count > RETRY_LIMIT:
+                    logger.warning(
+                        "Retry limit reach for job %s with labels: %s",
+                        job_details.url,
+                        job_details.labels,
+                    )
+                    msg.reject(requeue=False)
+                    continue
+
+                if msg_process_count > 1:
+                    backoff_time = _calculate_backoff_time(msg_process_count)
+                    logger.info(
+                        "Pause job %s with retry count %s for %s seconds (exponential backoff)",
+                        job_details.url,
+                        msg_process_count,
+                        backoff_time,
+                    )
+                    sleep(backoff_time)
+
                 if not _validate_labels(
                     labels=job_details.labels, supported_labels=supported_labels
                 ):
@@ -171,21 +216,24 @@ def consume(  # noqa: C901
 
 
 def _build_runner_metadata(job_url: str) -> RunnerMetadata:
-    """Build runner metadata from the job url."""
+    """Build runner metadata from the job url.
+
+    Args:
+        job_url: The job URL.
+
+    Returns:
+        RunnerMetadata for GitHub.
+
+    Raises:
+        ValueError: If the URL is not a GitHub URL.
+    """
     parsed_url = urlparse(job_url)
-    # We expect the netloc to contain github.com, otherwise this function will fail,
-    # as will use jobmanager code to handle github runners.
+    # We only support github.com URLs now
     if "github.com" in parsed_url.netloc:
         return RunnerMetadata()
 
-    # From here on jobmanager. For now we just regex on the url to check if it is the url
-    # of a runner.
-    match_result = re.match(r"^(.*)/v1/jobs/(\d+)$", parsed_url.path)
-    if not match_result:
-        logger.error("Invalid URL for a job. url: %s", job_url)
-        raise ValueError(f"Invalid format for job url {job_url}")
-    base_url = parsed_url._replace(path=match_result.group(1)).geturl()
-    return RunnerMetadata(platform_name="jobmanager", url=base_url)
+    logger.error("Invalid URL for a job. Only GitHub URLs are supported. url: %s", job_url)
+    raise ValueError(f"Invalid job url {job_url}. Only GitHub URLs are supported.")
 
 
 def _parse_job_details(msg: Message) -> JobDetails:
@@ -247,13 +295,16 @@ def _spawn_runner(
         return
     logger.info("Reactive runner spawned %s", instance_ids)
 
-    for _ in range(5):
-        sleep(60)
+    for attempt in range(5):
+        sleep(WAIT_TIME_IN_SEC)
         logger.info("Checking if job picked up for reactive runner %s", instance_ids)
-        if platform_provider.check_job_been_picked_up(metadata=metadata, job_url=job_url):
-            logger.info("Job picked %s. reactive runner ok %s", job_url, instance_ids)
-            msg.ack()
-            break
+        try:
+            if platform_provider.check_job_been_picked_up(metadata=metadata, job_url=job_url):
+                logger.info("Job picked %s. reactive runner ok %s", job_url, instance_ids)
+                msg.ack()
+                break
+        except JobNotFoundError:
+            logger.warning("Job not found after spawning runner. Retry (%s)/5", attempt)
     else:
         logger.info(
             "Job %s not picked by reactive runner %s. Probably picked up by another job",

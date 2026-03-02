@@ -1,4 +1,4 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Integration tests for charm upgrades."""
@@ -6,11 +6,11 @@
 import functools
 import pathlib
 
+import jubilant
 import pytest
 from juju.application import Application
 from juju.client import client
 from juju.model import Model
-from pytest_operator.plugin import OpsTest
 
 from charm_state import (
     BASE_VIRTUAL_MACHINES_CONFIG_NAME,
@@ -19,6 +19,12 @@ from charm_state import (
     OPENSTACK_NETWORK_CONFIG_NAME,
     USE_APROXY_CONFIG_NAME,
     VIRTUAL_MACHINES_CONFIG_NAME,
+)
+from tests.integration.conftest import (
+    DeploymentContext,
+    GitHubConfig,
+    OpenStackConfig,
+    ProxyConfig,
 )
 from tests.integration.helpers.common import (
     deploy_github_runner_charm,
@@ -31,67 +37,64 @@ pytestmark = pytest.mark.openstack
 
 @pytest.mark.asyncio
 async def test_charm_upgrade(
+    juju: jubilant.Juju,
     model: Model,
-    ops_test: OpsTest,
-    charm_file: str,
+    deployment_context: DeploymentContext,
     app_name: str,
-    path: str,
-    token: str,
-    openstack_http_proxy: str,
-    openstack_https_proxy: str,
-    openstack_no_proxy: str,
+    github_config: GitHubConfig,
+    openstack_config: OpenStackConfig,
     tmp_path: pathlib.Path,
-    clouds_yaml_contents: str,
-    network_name: str,
-    flavor_name: str,
     image_builder: Application,
 ):
     """
-    arrange: given latest stable version of the charm.
+    arrange: given latest edge version of the charm.
     act: charm upgrade is called.
     assert: the charm is upgraded successfully.
     """
-    latest_stable_path = tmp_path / "github-runner.charm"
-    latest_stable_revision = 354  # update this value every release to stable.
+    latest_edge_path = tmp_path / "github-runner.charm"
     # download the charm
-    retcode, stdout, stderr = await ops_test.juju(
-        "download",
-        "github-runner",
-        # do not specify revision
-        # --revision cannot be specified together with --arch, --base, --channel
-        "--channel",
-        "latest/stable",
-        "--series",
-        "jammy",
-        "--filepath",
-        str(latest_stable_path),
-        "--no-progress",
-    )
-    assert retcode == 0, f"failed to download charm, {stdout} {stderr}"
+    try:
+        juju.cli(
+            "download",
+            "github-runner",
+            # do not specify revision
+            # --revision cannot be specified together with --arch, --base, --channel
+            "--channel",
+            "latest/edge",
+            "--series",
+            "jammy",
+            "--filepath",
+            str(latest_edge_path),
+            "--no-progress",
+            include_model=False,
+        )
+    except jubilant.CLIError as exc:
+        pytest.fail(f"failed to download charm, {exc}")
 
-    # deploy latest stable version of the charm
+    # deploy latest edge version of the charm
     application = await deploy_github_runner_charm(
         model=model,
-        charm_file=str(latest_stable_path),
+        charm_file=str(latest_edge_path),
         app_name=app_name,
-        path=path,
-        token=token,
-        http_proxy=openstack_http_proxy,
-        https_proxy=openstack_https_proxy,
-        no_proxy=openstack_no_proxy,
+        github_config=github_config,
+        proxy_config=ProxyConfig(
+            http_proxy=openstack_config.http_proxy,
+            https_proxy=openstack_config.https_proxy,
+            no_proxy=openstack_config.no_proxy,
+        ),
         reconcile_interval=5,
         # override default virtual_machines=0 config.
         config={
-            OPENSTACK_CLOUDS_YAML_CONFIG_NAME: clouds_yaml_contents,
-            OPENSTACK_NETWORK_CONFIG_NAME: network_name,
-            OPENSTACK_FLAVOR_CONFIG_NAME: flavor_name,
+            OPENSTACK_CLOUDS_YAML_CONFIG_NAME: openstack_config.clouds_yaml_contents,
+            OPENSTACK_NETWORK_CONFIG_NAME: openstack_config.network_name,
+            OPENSTACK_FLAVOR_CONFIG_NAME: openstack_config.flavor_name,
             USE_APROXY_CONFIG_NAME: "true",
             VIRTUAL_MACHINES_CONFIG_NAME: 0,
             BASE_VIRTUAL_MACHINES_CONFIG_NAME: 1,
         },
         wait_idle=False,
     )
-    await model.integrate(f"{image_builder.name}:image", f"{application.name}:image")
+    await model.integrate(f"{image_builder.name}", f"{application.name}:image")
     await model.wait_for_idle(
         apps=[application.name, image_builder.name],
         raise_on_error=False,
@@ -102,17 +105,17 @@ async def test_charm_upgrade(
     origin = client.CharmOrigin(
         source="charm-hub",
         track="22.04",
-        risk="latest/stable",
+        risk="latest/edge",
         branch="deadbeef",
         hash_="hash",
         id_="id",
-        revision=latest_stable_revision,
+        revision=0,  # arbitrary number
         base=client.Base("22.04", "ubuntu"),
     )
 
     # upgrade the charm with current local charm
     await application.local_refresh(
-        path=charm_file,
+        path=deployment_context.charm_path,
         charm_origin=origin,
         force=False,
         force_series=False,

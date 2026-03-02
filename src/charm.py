@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Charm for creating and managing GitHub self-hosted runner instances."""
@@ -46,15 +46,18 @@ from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, WaitingSta
 import logrotate
 import manager_service
 from charm_state import (
+    ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME,
     DEBUG_SSH_INTEGRATION_NAME,
     IMAGE_INTEGRATION_NAME,
     LABELS_CONFIG_NAME,
     MONGO_DB_INTEGRATION_NAME,
     PATH_CONFIG_NAME,
+    PLANNER_INTEGRATION_NAME,
     TOKEN_CONFIG_NAME,
     CharmConfigInvalidError,
     CharmState,
     OpenstackImage,
+    PlannerRelationData,
     build_proxy_config_from_charm,
 )
 from errors import (
@@ -82,6 +85,7 @@ FAILED_RECONCILE_ACTION_ERR_MSG = (
 UPGRADE_MSG = "Upgrading github-runner charm."
 LEGACY_RECONCILE_TIMER_SERVICE = "ghro.reconcile-runners.timer"
 LEGACY_RECONCILE_SERVICE = "ghro.reconcile-runners.service"
+LEGACY_MANAGER_SINGLETON_SERVICE = "github-runner-manager.service"
 
 
 logger = logging.getLogger(__name__)
@@ -128,11 +132,11 @@ def catch_charm_errors(
         except ImageIntegrationMissingError:
             logger.exception("Missing image integration.")
             self.unit.status = BlockedStatus("Please provide image integration.")
-            manager_service.stop()
+            manager_service.stop(self.unit.name)
         except ImageNotFoundError:
             logger.exception("Missing image in image integration.")
             self.unit.status = WaitingStatus("Waiting for image over integration.")
-            manager_service.stop()
+            manager_service.stop(self.unit.name)
 
     return func_with_catch_errors
 
@@ -186,12 +190,31 @@ class GithubRunnerCharm(CharmBase):
         super().__init__(*args, **kwargs)
         self._log_charm_status()
 
-        self._grafana_agent = COSAgentProvider(self)
+        self._cos_agent = COSAgentProvider(
+            self,
+            scrape_configs=[
+                {
+                    "job_name": "github-runner",
+                    "metrics_path": "/metrics",
+                    "static_configs": [
+                        {
+                            "targets": [
+                                "localhost:"
+                                f"{manager_service.ensure_http_port_for_unit(self.unit.name)}"
+                            ]
+                        }
+                    ],
+                }
+            ],
+        )
 
         self._stored.set_default(
             path=self.config[PATH_CONFIG_NAME],  # for detecting changes
             token=self.config[TOKEN_CONFIG_NAME],  # for detecting changes
             labels=self.config[LABELS_CONFIG_NAME],  # for detecting changes
+            allow_external_contributor=self.config[
+                ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME
+            ],  # for detecting changes
         )
 
         self.on.define_event("reconcile_runners", ReconcileRunnersEvent)
@@ -213,6 +236,13 @@ class GithubRunnerCharm(CharmBase):
             self.on[IMAGE_INTEGRATION_NAME].relation_changed,
             self._on_image_relation_changed,
         )
+        self.framework.observe(
+            self.on[PLANNER_INTEGRATION_NAME].relation_changed,
+            self._on_planner_relation_changed,
+        )
+        self.framework.observe(
+            self.on[PLANNER_INTEGRATION_NAME].relation_broken, self._on_planner_relation_broken
+        )
         self.framework.observe(self.on.check_runners_action, self._on_check_runners_action)
         self.framework.observe(self.on.flush_runners_action, self._on_flush_runners_action)
         self.framework.observe(self.on.update_status, self._on_update_status)
@@ -227,7 +257,7 @@ class GithubRunnerCharm(CharmBase):
 
         self._manager_client = GitHubRunnerManagerClient(
             host=manager_service.GITHUB_RUNNER_MANAGER_ADDRESS,
-            port=manager_service.GITHUB_RUNNER_MANAGER_PORT,
+            port=manager_service.ensure_http_port_for_unit(self.unit.name),
         )
 
     def _setup_state(self) -> CharmState:
@@ -283,7 +313,7 @@ class GithubRunnerCharm(CharmBase):
             raise
 
         try:
-            manager_service.install_package()
+            manager_service.install_package(self.unit.name)
         except RunnerManagerApplicationInstallError:
             logger.error("Failed to install github runner manager package")
             # Not re-raising error for until the github-runner-manager service replaces the
@@ -314,6 +344,9 @@ class GithubRunnerCharm(CharmBase):
         logger.info(UPGRADE_MSG)
         self._common_install_code()
         _disable_legacy_service()
+        state = self._setup_state()
+        self._reconcile(state)
+        self._manager_client.flush_runner()
 
     @catch_charm_errors
     def _on_config_changed(self, _: ConfigChangedEvent) -> None:
@@ -321,7 +354,7 @@ class GithubRunnerCharm(CharmBase):
         state = self._setup_state()
 
         flush_runners = False
-        if state.charm_config.token != self._stored.token:
+        if self.config[TOKEN_CONFIG_NAME] != self._stored.token:
             self._stored.token = self.config[TOKEN_CONFIG_NAME]
             flush_runners = True
         if self.config[PATH_CONFIG_NAME] != self._stored.path:
@@ -330,10 +363,18 @@ class GithubRunnerCharm(CharmBase):
         if self.config[LABELS_CONFIG_NAME] != self._stored.labels:
             self._stored.labels = self.config[LABELS_CONFIG_NAME]
             flush_runners = True
+        if (
+            self.config[ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME]
+            != self._stored.allow_external_contributor
+        ):
+            self._stored.allow_external_contributor = self.config[
+                ALLOW_EXTERNAL_CONTRIBUTOR_CONFIG_NAME
+            ]
+            flush_runners = True
 
         self._check_image_ready()
 
-        self._setup_service(state)
+        self._reconcile(state)
 
         if flush_runners:
             logger.info("Flush runners on config-changed")
@@ -359,6 +400,15 @@ class GithubRunnerCharm(CharmBase):
     def _on_update_status(self, _: UpdateStatusEvent) -> None:
         """Handle the update of charm status."""
         self._log_juju_processes()
+
+    def _reconcile(self, state: CharmState) -> None:
+        """Reconcile the service and relations.
+
+        Args:
+            state: The charm state.
+        """
+        self._setup_service(state)
+        self._update_planner_flavor(state)
 
     def _setup_service(self, state: CharmState) -> None:
         """Set up services.
@@ -416,7 +466,7 @@ class GithubRunnerCharm(CharmBase):
     def _on_stop(self, _: StopEvent) -> None:
         """Handle the stopping of the charm."""
         self._manager_client.flush_runner(busy=True)
-        manager_service.stop()
+        manager_service.stop(self.unit.name)
 
     def _install_deps(self) -> None:
         """Install dependences for the charm."""
@@ -446,7 +496,7 @@ class GithubRunnerCharm(CharmBase):
         self._check_image_ready()
 
         state = self._setup_state()
-        self._setup_service(state)
+        self._reconcile(state)
 
         self._manager_client.flush_runner()
         self.unit.status = ActiveStatus()
@@ -469,28 +519,44 @@ class GithubRunnerCharm(CharmBase):
         self._check_image_ready()
 
         state = self._setup_state()
-        self._setup_service(state)
+        self._reconcile(state)
 
         self._manager_client.flush_runner()
+        self.unit.status = ActiveStatus()
+
+    @catch_charm_errors
+    def _on_planner_relation_changed(self, _: ops.RelationChangedEvent) -> None:
+        """Handle planner relation changed event."""
+        self.unit.status = MaintenanceStatus("Setup planner")
+        state = self._setup_state()
+        self._reconcile(state)
+        self.unit.status = ActiveStatus()
+
+    @catch_charm_errors
+    def _on_planner_relation_broken(self, _: ops.RelationBrokenEvent) -> None:
+        """Handle planner relation broken event."""
+        self.unit.status = MaintenanceStatus("Cleanup planner data")
+        state = self._setup_state()
+        self._reconcile(state)
         self.unit.status = ActiveStatus()
 
     @catch_charm_errors
     def _on_database_created(self, _: ops.RelationEvent) -> None:
         """Handle the MongoDB database created event."""
         state = self._setup_state()
-        self._setup_service(state)
+        self._reconcile(state)
 
     @catch_charm_errors
     def _on_endpoints_changed(self, _: ops.RelationEvent) -> None:
         """Handle the MongoDB endpoints changed event."""
         state = self._setup_state()
-        self._setup_service(state)
+        self._reconcile(state)
 
     @catch_charm_errors
     def _on_mongodb_relation_broken(self, _: ops.RelationDepartedEvent) -> None:
         """Handle the MongoDB relation broken event."""
         state = self._setup_state()
-        self._setup_service(state)
+        self._reconcile(state)
 
     def _check_image_ready(self) -> None:
         """Check if image is ready raises error if not.
@@ -504,6 +570,22 @@ class GithubRunnerCharm(CharmBase):
             raise ImageIntegrationMissingError("No image integration found")
         if not openstack_image.id:
             raise ImageNotFoundError("No image found in the image integration")
+
+    def _update_planner_flavor(self, state: CharmState) -> None:
+        """Update the planner relation with current flavor labels including image tags."""
+        if not self.unit.is_leader():
+            return
+        relations = self.model.relations.get(PLANNER_INTEGRATION_NAME)
+        if not relations:
+            logger.debug("No planner relation found. Skipping flavor update.")
+            return
+        flavor_data = PlannerRelationData(
+            flavor=self.app.name,
+            labels=tuple(self._create_labels(state)),
+            minimum_pressure=state.runner_config.base_virtual_machines,
+        )
+        for relation in relations:
+            relation.data[self.app].update(flavor_data.to_relation_data())
 
     @staticmethod
     def _create_labels(state: CharmState) -> list[str]:
@@ -562,7 +644,8 @@ def _setup_runner_manager_user() -> None:
         )
 
 
-def _disable_legacy_service() -> None:
+# 2025-01-14 Disable too complex errors, this migration function is targeted for deprecation.
+def _disable_legacy_service() -> None:  # noqa: C901
     """Disable any legacy service."""
     logger.info("Attempting to stop legacy services")
     try:
@@ -575,12 +658,22 @@ def _disable_legacy_service() -> None:
         systemd.service_stop(LEGACY_RECONCILE_SERVICE)
     except systemd.SystemdError:
         pass
+    # Stop and disable the pre-instance singleton service if it exists.
+    try:
+        systemd.service_disable(LEGACY_MANAGER_SINGLETON_SERVICE)
+        systemd.service_stop(LEGACY_MANAGER_SINGLETON_SERVICE)
+    except systemd.SystemdError:
+        pass
 
     try:
         timer_path = pathlib.Path("/etc/systemd/system") / LEGACY_RECONCILE_TIMER_SERVICE
         service_path = pathlib.Path("/etc/systemd/system") / LEGACY_RECONCILE_SERVICE
+        manager_singleton_path = (
+            pathlib.Path("/etc/systemd/system") / LEGACY_MANAGER_SINGLETON_SERVICE
+        )
         timer_path.unlink(missing_ok=True)
         service_path.unlink(missing_ok=True)
+        manager_singleton_path.unlink(missing_ok=True)
     except OSError:
         logger.warning(
             "Unexpected exception during removal of legacy systemd service files", exc_info=True

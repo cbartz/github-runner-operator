@@ -1,15 +1,16 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """GitHub API client.
 
 Migrate to PyGithub in the future. PyGithub is still lacking some API such as get runner groups.
 """
+
 import functools
 import logging
 from datetime import datetime
 from typing import Callable, ParamSpec, TypeVar
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import requests
 
@@ -18,16 +19,12 @@ from fastcore.net import (  # pylint: disable=no-name-in-module
     HTTP404NotFoundError,
     HTTP422UnprocessableEntityError,
 )
-from ghapi.all import GhApi, pages
+from ghapi.all import GhApi
 from ghapi.page import paged
 from requests import RequestException
 from typing_extensions import assert_never
 
-from github_runner_manager.configuration.github import (
-    GitHubOrg,
-    GitHubPath,
-    GitHubRepo,
-)
+from github_runner_manager.configuration.github import GitHubOrg, GitHubPath, GitHubRepo
 from github_runner_manager.manager.models import InstanceID
 from github_runner_manager.platform.platform_provider import (
     DeleteRunnerBusyError,
@@ -39,13 +36,18 @@ from github_runner_manager.types_.github import JITConfig, JobInfo, SelfHostedRu
 
 logger = logging.getLogger(__name__)
 
+# Timeout in seconds for HTTP calls made directly with the requests library.
+# Note: ghapi calls via _GhVerb.__call__ silently drop the timeout kwarg, so this constant
+# is only effective for requests.get/post calls (e.g. _get_runner_group_id).
+TIMEOUT_IN_SECS = 5 * 60
+
 
 class GithubRunnerNotFoundError(Exception):
     """Represents an error when the runner could not be found on GitHub."""
 
 
 # Parameters of the function decorated with retry
-ParamT = ParamSpec("ParamT")
+ParamT = ParamSpec("ParamT")  # pylint: disable=invalid-name
 # Return type of the function decorated with retry
 ReturnT = TypeVar("ReturnT")
 
@@ -77,6 +79,7 @@ def catch_http_errors(func: Callable[ParamT, ReturnT]) -> Callable[ParamT, Retur
         """
         try:
             return func(*args, **kwargs)
+        # The ghapi module uses urllib. The HTTPError and URLError are urllib exceptions.
         except HTTPError as exc:
             if exc.code in (401, 403):
                 if exc.code == 401:
@@ -86,8 +89,14 @@ def catch_http_errors(func: Callable[ParamT, ReturnT]) -> Callable[ParamT, Retur
                 raise TokenError(msg) from exc
             logger.warning("Error in GitHub request: %s", exc)
             raise PlatformApiError from exc
+        except URLError as exc:
+            logger.warning("General error in GitHub request: %s", exc)
+            raise PlatformApiError from exc
         except RequestException as exc:
             logger.warning("Error in GitHub request: %s", exc)
+            raise PlatformApiError from exc
+        except TimeoutError as exc:
+            logger.warning("Timeout in GitHub request: %s", exc)
             raise PlatformApiError from exc
 
     return wrapper
@@ -147,41 +156,29 @@ class GithubClient:
         Returns:
             List of runner information.
         """
-        remote_runners_list: list[SelfHostedRunner] = []
+        remote_runners_list: list[dict] = []
 
         if isinstance(path, GitHubRepo):
-            # The documentation of ghapi for pagination is incorrect and examples will give errors.
-            # This workaround is a temp solution. Will be moving to PyGitHub in the future.
-            self._client.actions.list_self_hosted_runners_for_repo(
-                owner=path.owner, repo=path.repo, per_page=100
-            )
-            num_of_pages = self._client.last_page()
-            remote_runners_list = [
-                item
-                for page in pages(
-                    self._client.actions.list_self_hosted_runners_for_repo,
-                    num_of_pages + 1,
-                    owner=path.owner,
-                    repo=path.repo,
-                    per_page=100,
-                )
-                for item in page["runners"]
-            ]
-        if isinstance(path, GitHubOrg):
-            # The documentation of ghapi for pagination is incorrect and examples will give errors.
-            # This workaround is a temp solution. Will be moving to PyGitHub in the future.
-            self._client.actions.list_self_hosted_runners_for_org(org=path.org, per_page=100)
-            num_of_pages = self._client.last_page()
-            remote_runners_list = [
-                item
-                for page in pages(
-                    self._client.actions.list_self_hosted_runners_for_org,
-                    num_of_pages + 1,
-                    org=path.org,
-                    per_page=100,
-                )
-                for item in page["runners"]
-            ]
+            for page in paged(
+                self._client.actions.list_self_hosted_runners_for_repo,
+                owner=path.owner,
+                repo=path.repo,
+                per_page=100,
+            ):
+                runners = page["runners"]
+                if not runners:
+                    break
+                remote_runners_list.extend(runners)
+        elif isinstance(path, GitHubOrg):
+            for page in paged(
+                self._client.actions.list_self_hosted_runners_for_org,
+                org=path.org,
+                per_page=100,
+            ):
+                runners = page["runners"]
+                if not runners:
+                    break
+                remote_runners_list.extend(runners)
 
         # Filter by prefix and create the SelfHostedRunner instances.
         managed_runners_list = []
@@ -249,7 +246,7 @@ class GithubClient:
             "Authorization": f"Bearer {self._token}",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        response = requests.get(url, headers=headers, timeout=30)
+        response = requests.get(url, headers=headers, timeout=TIMEOUT_IN_SECS)
         response.raise_for_status()
         data = response.json()
         try:
@@ -310,7 +307,11 @@ class GithubClient:
         Returns:
             Job information.
         """
-        paged_kwargs = {"owner": path.owner, "repo": path.repo, "run_id": workflow_run_id}
+        paged_kwargs = {
+            "owner": path.owner,
+            "repo": path.repo,
+            "run_id": workflow_run_id,
+        }
         try:
             for wf_run_page in paged(
                 self._client.actions.list_jobs_for_workflow_run, **paged_kwargs
@@ -374,9 +375,10 @@ class GithubClient:
         # which is not supported by datetime.fromisoformat
         created_at = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
         started_at = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
-        # conclusion could be null per api schema, so we need to handle that,
-        # though we would assume that it should always be present, as the job should be finished.
-        conclusion = job.get("conclusion", None)
+        # conclusion could be null or an empty dictionary per api schema, so we need to handle
+        # that though we would assume that it should always be present, as the job should be
+        # finished.
+        conclusion = job.get("conclusion", None) or None
 
         status = job["status"]
         job_id = job["id"]

@@ -1,7 +1,8 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Module for reconciling amount of runner and reactive runner processes."""
+
 import logging
 from dataclasses import dataclass
 
@@ -128,3 +129,8 @@ def reconcile(
     )
 
     return ReconcileResult(processes_diff=processes_created, metric_stats=metric_stats)
+
+
+def flush_reactive_processes() -> None:
+    """Flush all the reactive processes."""
+    process_manager.kill_reactive_processes()

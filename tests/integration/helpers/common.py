@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Utilities for integration test."""
@@ -11,7 +11,7 @@ import typing
 from asyncio import sleep
 from datetime import datetime, timezone
 from functools import partial
-from typing import Awaitable, Callable, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, ParamSpec, TypeVar, cast
 
 import github
 import requests
@@ -20,6 +20,8 @@ from github.Repository import Repository
 from github.Workflow import Workflow
 from github.WorkflowJob import WorkflowJob
 from github.WorkflowRun import WorkflowRun
+from github_runner_manager.metrics.events import METRICS_LOG_PATH
+from github_runner_manager.reactive.process_manager import REACTIVE_RUNNER_LOG_DIR
 from juju.action import Action
 from juju.application import Application
 from juju.model import Model
@@ -44,9 +46,15 @@ DISPATCH_E2E_TEST_RUN_WORKFLOW_FILENAME = "e2e_test_run.yaml"
 DISPATCH_E2E_TEST_RUN_OPENSTACK_WORKFLOW_FILENAME = "e2e_test_run_openstack.yaml"
 
 MONGODB_APP_NAME = "mongodb"
-DEFAULT_RUNNER_CONSTRAINTS = {"root-disk": 15}
+# 2025-11-26: Set deployment type to virtual-machine due to bug with snapd. See:
+# https://github.com/canonical/snapd/pull/16131
+DEFAULT_RUNNER_CONSTRAINTS = {"root-disk": 20 * 1024, "virt-type": "virtual-machine"}
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    # Import only for type checking to avoid pytest fixture side effects at runtime
+    from tests.integration.conftest import GitHubConfig, ProxyConfig
 
 
 async def run_in_unit(
@@ -115,8 +123,10 @@ async def wait_for_reconcile(app: Application) -> None:
     unit = app.units[0]
     base_id = await get_reconcile_id(unit)
     for _ in range(10):
+        logger.info("Waiting for reconcile ID: %s", base_id)
         await sleep(60)
         current_id = await get_reconcile_id(unit)
+        logger.info("Current reconcile ID: %s, expected reconcile ID: %s", current_id, base_id)
         if base_id != current_id:
             return
 
@@ -148,16 +158,15 @@ async def deploy_github_runner_charm(
     model: Model,
     charm_file: str,
     app_name: str,
-    path: str,
-    token: str,
-    http_proxy: str,
-    https_proxy: str,
-    no_proxy: str,
+    github_config: "GitHubConfig",
+    proxy_config: "ProxyConfig",
     reconcile_interval: int,
     constraints: dict | None = None,
     config: dict | None = None,
     deploy_kwargs: dict | None = None,
     wait_idle: bool = True,
+    base: str = "ubuntu@22.04",
+    series: str = "jammy",
 ) -> Application:
     """Deploy github-runner charm.
 
@@ -165,33 +174,33 @@ async def deploy_github_runner_charm(
         model: Model to deploy the charm.
         charm_file: Path of the charm file to deploy.
         app_name: Application name for the deployment.
-        path: Path representing the GitHub repo/org.
-        token: GitHub Personal Token for the application to use.
-        http_proxy: HTTP proxy for the application to use.
-        https_proxy: HTTPS proxy for the application to use.
-        no_proxy: No proxy configuration for the application.
+        github_config: Object providing GitHub settings with attributes `path` and `token`.
+        proxy_config: Object providing proxy settings with attributes `http_proxy`,
+            `https_proxy`, and `no_proxy`.
         reconcile_interval: Time between reconcile for the application.
         constraints: The custom machine constraints to use. See DEFAULT_RUNNER_CONSTRAINTS
             otherwise.
         config: Additional custom config to use.
         deploy_kwargs: Additional model deploy arguments.
         wait_idle: wait for model to become idle.
+        base: Charm base to deploy on (e.g., ubuntu@22.04).
+        series: Ubuntu series corresponding to the base (e.g., jammy).
 
     Returns:
         The charm application that was deployed.
     """
     await model.set_config(
         {
-            "juju-http-proxy": http_proxy,
-            "juju-https-proxy": https_proxy,
-            "juju-no-proxy": no_proxy,
+            "juju-http-proxy": proxy_config.http_proxy,
+            "juju-https-proxy": proxy_config.https_proxy,
+            "juju-no-proxy": proxy_config.no_proxy,
             "logging-config": "<root>=INFO;unit=INFO",
         }
     )
 
     default_config = {
-        PATH_CONFIG_NAME: path,
-        TOKEN_CONFIG_NAME: token,
+        PATH_CONFIG_NAME: github_config.path,
+        TOKEN_CONFIG_NAME: github_config.token,
         BASE_VIRTUAL_MACHINES_CONFIG_NAME: 0,
         TEST_MODE_CONFIG_NAME: "insecure",
         RECONCILE_INTERVAL_CONFIG_NAME: reconcile_interval,
@@ -203,7 +212,8 @@ async def deploy_github_runner_charm(
     application = await model.deploy(
         charm_file,
         application_name=app_name,
-        base="ubuntu@22.04",
+        base=base,
+        series=series,
         config=default_config,
         constraints=constraints or DEFAULT_RUNNER_CONSTRAINTS,
         **(deploy_kwargs or {}),
@@ -410,25 +420,24 @@ async def wait_for(
     Returns:
         The result of the function if any.
     """
+
+    async def _call() -> R:
+        """Await the function if it returns an awaitable, otherwise cast and return."""
+        result = func()
+        if inspect.isawaitable(result):
+            return await cast(Awaitable, result)
+        return cast(R, result)
+
     deadline = time.time() + timeout
-    is_awaitable = inspect.iscoroutinefunction(func)
     while time.time() < deadline:
-        if is_awaitable:
-            if result := await cast(Awaitable, func()):
-                return result
-        else:
-            if result := func():
-                return cast(R, result)
+        if result := await _call():
+            return result
         logger.info("Wait for condition not met, sleeping %s", check_interval)
         time.sleep(check_interval)
 
     # final check before raising TimeoutError.
-    if is_awaitable:
-        if result := await cast(Awaitable, func()):
-            return result
-    else:
-        if result := func():
-            return cast(R, result)
+    if result := await _call():
+        return result
     raise TimeoutError()
 
 
@@ -493,3 +502,45 @@ async def get_github_runner_manager_service_log(unit: Unit) -> str:
     assert return_code == 0, f"Get log with cat {log_file_path} failed with: {stderr}"
     assert stdout is not None
     return stdout
+
+
+async def get_github_runner_reactive_log(unit: Unit) -> str:
+    """Get the logs of github-runner-manager reactive processes.
+
+    Args:
+        unit: The unit to get the logs from.
+
+    Returns:
+        Reactive process logs.
+    """
+    log_file_path = REACTIVE_RUNNER_LOG_DIR / "*.log"
+    _, stdout, stderr = await run_in_unit(
+        unit,
+        f"cat {log_file_path}",
+        timeout=60,
+        assert_on_failure=False,
+        assert_msg="Failed to get the GitHub runner manager reactive logs",
+    )
+
+    return stdout or stderr or "Empty reactive log"
+
+
+async def get_github_runner_metrics_log(unit: Unit) -> str:
+    """Get the github-runner-manager metric logs.
+
+    Args:
+        unit: The unit to get the logs from.
+
+    Returns:
+        Runner metrics logs.
+    """
+    log_file_path = METRICS_LOG_PATH
+    _, stdout, stderr = await run_in_unit(
+        unit,
+        f"cat {log_file_path}",
+        timeout=60,
+        assert_on_failure=False,
+        assert_msg="Failed to get the GitHub runner manager metrics",
+    )
+
+    return stdout or stderr or "Empty metrics log"

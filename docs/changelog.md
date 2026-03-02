@@ -2,11 +2,149 @@
 
 This changelog documents user-relevant changes to the GitHub runner charm.
 
+## 2026-02-27
+
+- Fix a bug where image labels (base,arch) are not propagated to the planner charm.
+- Fix a bug where max_total_virtual_machines is not propagated to the github-runner-manager when used with the planner.
+
+## 2026-02-25
+
+- Introduce planner-driven pressure reconciler.
+
+## 2026-02-25
+
+- Add the  `How to upgrade` documentation.
+
+## 2026-02-12
+
+- Add support to integrate with GitHub Runner planner charm with the `github_runner_planner_v0` interface.
+
+## 2026-02-11
+
+- Fixed charm hook errors caused by `ghapi`'s `pages()` leaving a stuck multiprocessing process that held the HTTP port.
+
+## 2026-02-06
+
+- Migrated to latest consolidated `charmcraft.yaml` syntax and added 24.04, 26.04 bases.
+
+## 2026-02-02
+
+- Deprecated `repo-policy-compliance` service.
+
+## 2025-01-26
+
+- Add machine input parameter for terraform charm module to allow targeting specific machines for
+  GitHub runner application deployment.
+
+## 2025-01-14
+
+- Add support for running up to 100 multiple GitHub runner applications on a single instance.
+- Backward-incompatible: services for each unit replace the legacy singleton service and
+  remove the previous shared storage layout. Existing deployments must redeploy the
+  application to adopt the new model where each unit has its own service. Upgrades will disable any legacy
+  service during charm upgrade.
+
+## 2025-01-07
+
+- Add retry to apt-get update in cloud init stage of runner creation. This should improve stability in runner creation during network instability.
+
+## 2025-12-19
+
+- Revert deletion of apt-get update due to the impact on existing workflows.
+
+## 2025-12-17
+
+- Extend contributor check on private-repositories to contributors.
+- Moved charm-architecture documents from Explanation to Reference category.
+
+## 2025-12-16
+
+- Implemented exponential backoff strategy for reactive consumer message retries to reduce load on dependencies during sustained failures. The backoff starts at 60 seconds and doubles with each retry, capped at 1800 seconds (30 minutes).
+
+## 2025-12-10
+
+- Removed apt update step in cloud-init of the VM creation step since it is now applied in the
+GitHub runner image builder side.
+
+## 2025-12-05
+
+- Modified pre-job script to distinguish between internal PRs and fork PRs when applying author association checks. Internal PRs (where head and base repositories match) now skip the author association check, allowing team members to run workflows on their internal branches. Fork PRs continue to enforce OWNER/MEMBER/COLLABORATOR requirements for security.
+
+## 2025-12-01
+
+- Added timeouts to API calls (OpenStack, GitHub, repo-policy-compliance) to fix a hanging GitHub runner manager application.
+
+## 2025-11-30
+
+- Added a new configuration option `allow-external-contributor` as an non-external replacement for
+  `repo-policy-compliance` service.
+
+## 2025-11-21
+
+- Updated broken links in `docs/how-to/index.md`.
+
+## 2025-11-11
+
+- Added Grafana dashboard using Prometheus data source.
+
+## 2025-11-12
+
+- Removed the jobmanager platform provider and related integration tests as they are no longer used and not part of any public API.
+
+## 2025-08-27
+
+- Updated the documentation workflow to be fully integrated with the Vale GitHub Action.
+
+## 2025-08-26
+
+- Add charm configuration for setting the log level of the GitHub runner manager service.
+
+## 2025-08-25
+
+- Fix issue with scaling down overshooting in deleting runners after cleanup
+
+## 2025-08-20
+
+- Document relevant log files.
+
+## 2025-08-12
+
+- Metrics are now issued even without runner installed timestamp.
+
+## 2025-07-28
+
+- Fix an issue where the charm can error out due to timeout during flush runners.
+
+## 2025-07-24
+
+- Fix an issue with infinite retry of a reactive job message.
+
+## 2025-07-22
+
+- Removed support for using both jobmanager and GitHub at the same time.
+
+## 2025-07-18
+
+- Fix an issue where flushing runners does not include reactive processes. This cause some reactive runner to spawn with old code after upgrade.
+
+## 2025-07-16
+
+- Split the `reconcile_duration` buckets for Prometheus metrics into a larger bucket set.
+- Fix the incorrect default value of the aproxy-exclude-addresses configuration.
+
+## 2025-07-09
+
+- Specify max supported nova compute API to be 2.91. This fixes an issue where the charm could fail
+  due to a bug on the OpenStack side: https://bugs.launchpad.net/nova/+bug/2095364
+
+### 2025-06-30
+
+- New configuration options aproxy-exclude-addresses and aproxy-redirect-ports for allowing aproxy to redirect arbitrary TCP traffic
+- Added prometheus metrics to the GitHub runner manager application.
+
 ## 2025-06-26
 
 - Fix a process leak internal to the charm.
-
-## 2025-06-24
 
 - Fix a bug where deleted GitHub Actions Job would cause an endless loop of retries.
 
@@ -16,9 +154,8 @@ This changelog documents user-relevant changes to the GitHub runner charm.
 
 ### 2025-06-16
 
-- Revert copytruncate logrotate method for reactive processes, as copytruncate keeps log files on disks and does not remove them, and each process is writing to a new file leading to a huge and increasing amount
-of zero sized files in the reactive log directory. This is a temporary fix until a better solution is implemented, as it has the downside that long lived reactive processes may write to deleted log files.
-
+- Revert `copytruncate logrotate` method for reactive processes, as `copytruncate` keeps log files on disks and does not remove them, and each process is writing to a new file leading to a huge and increasing amount
+  of zero sized files in the reactive log directory. This is a temporary fix until a better solution is implemented, as it has the downside that long lived reactive processes may write to deleted log files.
 
 ### 2025-06-12
 
@@ -30,9 +167,9 @@ of zero sized files in the reactive log directory. This is a temporary fix until
 
 ### 2025-06-04
 
-- Reduce the reconcile-interval configuration from 10 minutes to 5 minutes. This is the interval 
-between reconciling the current and intended number of runners. The value should be kept low, 
-unless Github API rate limiting is encountered.
+- Reduce the reconcile-interval configuration from 10 minutes to 5 minutes. This is the interval
+  between reconciling the current and intended number of runners. The value should be kept low,
+  unless GitHub API rate limiting is encountered.
 - Removed the reconcile-runners Juju action.
 
 ### 2025-06-03
@@ -41,9 +178,8 @@ unless Github API rate limiting is encountered.
 
 ### 2025-05-22
 
-- Add possibility to run a script in the pre-job phase of a runner. This can be useful to setup 
-network/infrastructure specific things.
-
+- Add possibility to run a script in the pre-job phase of a runner. This can be useful to setup
+  network/infrastructure specific things.
 
 ### 2025-05-09
 
@@ -52,8 +188,8 @@ network/infrastructure specific things.
 ### 2025-05-06
 
 - The ssh health checks are removed and GitHub is used instead to get the runners health
-information. This implies many changes in both the structure of the project and its functionality. Potentially, many race conditions should
-disappear.
+  information. This implies many changes in both the structure of the project and its functionality. Potentially, many race conditions should
+  disappear.
 
 ### 2025-04-28
 
@@ -65,7 +201,7 @@ disappear.
 
 ### 2025-04-15
 
-- Fix a race condition where keypairs were being deleted even though the server was being built, potentially killing active github action runs.
+- Fix a race condition where key pairs were being deleted even though the server was being built, potentially killing active GitHub action runs.
 
 ### 2025-04-09
 
@@ -76,7 +212,7 @@ disappear.
 - Add proxy configuration options for charm to facilitate its use in corporate environments.
   - manager-ssh-proxy-command: ProxyCommand ssh-config option used to ssh from the manager to the runners.
   - runner-http-proxy: Allows the proxy in the runner to be different to the proxy in the
-    juju model config for the manager.
+    Juju model config for the manager.
   - use-runner-proxy-for-tmate: Whether to proxy the ssh connection from the runner to the tmate-server
     using the runner http proxy.
 
@@ -87,7 +223,7 @@ disappear.
 ### 2025-03-24
 
 - New terraform product module. This module is composed of one github-runner-image-builder application and the related
-github-runner applications.
+  github-runner applications.
 
 ### 2024-12-13
 
@@ -95,7 +231,7 @@ github-runner applications.
 
 ### 2024-12-05
 
-- Bugfix to no longer stop the reconciliation when a runner's health check fails.
+- Bug fix to no longer stop the reconciliation when a runner's health check fails.
 
 ### 2024-12-04
 
@@ -111,16 +247,16 @@ github-runner applications.
 
 ### 2024-11-13
 
-- Added documentation for the reactive mode (howto and mongodb integration references).
+- Added documentation for the reactive mode (how-to and mongodb integration references).
 - Align the README with the one in https://github.com/canonical/is-charms-template-repo.
 
 ### 2024-10-24
 
-- Add "expected_runners" to reconciliation metric.
+- Add `expected_runners` to reconciliation metric.
 
 ### 2024-10-23
 
-- Fixed the wrong dateformat usage in the server uniqueness check.
+- Fixed the wrong `dateformat` usage in the server uniqueness check.
 
 ### 2024-10-21
 
@@ -128,19 +264,19 @@ github-runner applications.
 
 ### 2024-10-18
 
-- Bugfix for logrotate configuration ("nocreate" must be passed explicitly)
+- Bug fix for `logrotate` configuration (`nocreate` must be passed explicitly)
 
 ### 2024-10-17
 
 - Use in-memory authentication instead of clouds.yaml on disk for OpenStack. This prevents
-the multi-processing fighting over the file handle for the clouds.yaml file in the github-runner-manager.
+  the multi-processing fighting over the file handle for the clouds.yaml file in the `github-runner-manager`.
 
 - Fixed a bug where metrics storage for unmatched runners could not get cleaned up.
 
 ### 2024-10-11
 
 - Added support for COS integration with reactive runners.
-- The charm now creates a dedicated user which is used for running the reactive process and 
+- The charm now creates a dedicated user which is used for running the reactive process and
   storing metrics and ssh keys (also for non-reactive mode).
 
 ### 2024-10-07
@@ -155,7 +291,7 @@ the multi-processing fighting over the file handle for the clouds.yaml file in t
 
 ### 2024-09-24
 
-- Added support for spawning a runner reactively.
+- Added support for spawning a reactive runner.
 - Fixed a bug where busy runners are killed instead of only idle runners.
 
 ### 2024-09-18

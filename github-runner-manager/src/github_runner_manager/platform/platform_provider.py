@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Base classes and APIs for platform providers."""
@@ -7,6 +7,7 @@ import abc
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
+from typing import Sequence
 
 from pydantic import HttpUrl
 
@@ -17,6 +18,18 @@ from github_runner_manager.manager.models import (
     RunnerMetadata,
 )
 from github_runner_manager.types_.github import GitHubRunnerStatus, SelfHostedRunner
+
+_GITHUB_PLATFORM_KEY = "github"
+
+
+class Platform(str, Enum):
+    """Enum for supported platforms.
+
+    Attributes:
+        GITHUB: GitHub platform.
+    """
+
+    GITHUB = _GITHUB_PLATFORM_KEY
 
 
 class PlatformError(Exception):
@@ -71,13 +84,11 @@ class PlatformProvider(abc.ABC):
         """
 
     @abc.abstractmethod
-    def delete_runner(self, runner_identity: RunnerIdentity) -> None:
-        """Delete a  runner.
-
-        Can raise DeleteRunnerBusyError
+    def delete_runners(self, runner_ids: Sequence[str]) -> list[str]:
+        """Delete runners.
 
         Args:
-            runner_identity: Runner to delete.
+            runner_ids: Runner IDs to delete.
         """
 
     @abc.abstractmethod
@@ -180,8 +191,7 @@ class PlatformRunnerState(str, Enum):
 
     Attributes:
         BUSY: Runner is working on a job assigned.
-        IDLE: Runner is waiting to take a job or is running pre-job tasks (i.e.
-            repo-policy-compliance check).
+        IDLE: Runner is waiting to take a job or is running pre-job tasks.
         OFFLINE: Runner is not connected.
     """
 

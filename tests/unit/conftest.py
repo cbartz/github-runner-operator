@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 import copy
@@ -12,6 +12,7 @@ from github_runner_manager.configuration.github import GitHubOrg
 
 import charm_state
 import utilities
+from models import FlavorLabel, OpenStackCloudsYAML
 
 
 @pytest.fixture(name="exec_command")
@@ -35,9 +36,15 @@ def disk_usage_mock(total_disk: int):
 
 
 @pytest.fixture(autouse=True)
-def mocks(monkeypatch, tmp_path, exec_command):
+def mocks(monkeypatch, tmp_path, exec_command, request):
+    if "nomocks" in request.keywords:
+        return
     monkeypatch.setattr("charm.execute_command", exec_command)
     monkeypatch.setattr("charm_state.CHARM_STATE_PATH", Path(tmp_path / "charm_state.json"))
+    monkeypatch.setattr(
+        "manager_service.ensure_http_port_for_unit",
+        unittest.mock.MagicMock(return_value=55555),
+    )
 
 
 @pytest.fixture(autouse=True, name="cloud_name")
@@ -117,7 +124,6 @@ def skip_retry_fixture(monkeypatch: pytest.MonkeyPatch):
 def complete_charm_state_fixture():
     """Returns a fixture with a fully populated CharmState."""
     return charm_state.CharmState(
-        arch="arm64",
         is_metrics_logging_available=False,
         proxy_config=charm_state.ProxyConfig(
             http="http://httpproxy.example.com:3128",
@@ -130,9 +136,10 @@ def complete_charm_state_fixture():
             no_proxy="10.0.0.1",
         ),
         charm_config=charm_state.CharmConfig(
+            allow_external_contributor=False,
             dockerhub_mirror="https://docker.example.com",
             labels=("label1", "label2"),
-            openstack_clouds_yaml=charm_state.OpenStackCloudsYAML(
+            openstack_clouds_yaml=OpenStackCloudsYAML(
                 clouds={
                     "microstack": {
                         "auth": {
@@ -149,19 +156,16 @@ def complete_charm_state_fixture():
             ),
             path=GitHubOrg(org="canonical", group="group"),
             reconcile_interval=5,
-            repo_policy_compliance=charm_state.RepoPolicyComplianceConfig(
-                token="token",
-                url="https://compliance.example.com",
-            ),
             token="githubtoken",
             manager_proxy_command="ssh -W %h:%p example.com",
             use_aproxy=True,
+            runner_manager_log_level="INFO",
         ),
         runner_config=charm_state.OpenstackRunnerConfig(
             base_virtual_machines=1,
             max_total_virtual_machines=2,
             flavor_label_combinations=[
-                charm_state.FlavorLabel(
+                FlavorLabel(
                     flavor="flavor",
                     label="flavorlabel",
                 )
@@ -184,4 +188,5 @@ def complete_charm_state_fixture():
                 ed25519_fingerprint="SHA256:ed25519",
             ),
         ],
+        planner_config=None,
     )

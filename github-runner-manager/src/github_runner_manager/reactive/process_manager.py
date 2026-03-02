@@ -1,7 +1,8 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Module for managing processes which spawn runners reactively."""
+
 import logging
 import os
 import shutil
@@ -88,6 +89,23 @@ def reconcile(
         logger.info("No changes to number of reactive runner processes needed.")
 
     return delta
+
+
+def kill_reactive_processes() -> None:
+    """Kill all reactive processes."""
+    pids = _get_pids()
+    if pids:
+        for pid in pids:
+            try:
+                logger.info("Killing reactive runner process with pid %s", pid)
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                logger.info(
+                    "Failed to kill process with pid %s. Process might have terminated it self.",
+                    pid,
+                )
+    else:
+        logger.info("No reactive processes to flush")
 
 
 def _get_pids() -> list[int]:

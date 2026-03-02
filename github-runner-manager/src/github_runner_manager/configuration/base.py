@@ -1,4 +1,4 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Base configuration for the Application."""
@@ -10,7 +10,7 @@ from typing import Optional, TextIO
 import yaml
 from pydantic import AnyHttpUrl, BaseModel, Field, IPvAnyAddress, MongoDsn, root_validator
 
-from github_runner_manager.configuration import github, jobmanager
+from github_runner_manager.configuration import github
 from github_runner_manager.openstack_cloud.configuration import OpenStackConfiguration
 
 logger = logging.getLogger(__name__)
@@ -38,25 +38,33 @@ class ApplicationConfiguration(BaseModel):
     """Main entry point for the Application Configuration.
 
     Attributes:
+        allow_external_contributor: Whether to allow runs from forked repository from an external
+            contributor. Enabling this option will enable all runs from forked repositories. By
+            default, runs from contribution authors being in COLLABORATOR, MEMBER or OWNER status
+            is allowed. See \
+            https://docs.github.com/en/graphql/reference/enums#commentauthorassociation.
         name: Name to identify the manager. Used for metrics.
         extra_labels: Extra labels to add to the runner.
-        jobmanager_config: Configuration for the jobmanager platform.
         github_config: GitHub configuration.
         service_config: The configuration for supporting services.
         non_reactive_configuration: Configuration for non-reactive mode.
         reactive_configuration: Configuration for reactive mode.
         openstack_configuration: Configuration for authorization to a OpenStack host.
-        reconcile_interval: Seconds to wait between reconciliation.
+        planner_url: Base URL of the planner service.
+        planner_token: Bearer token to authenticate against the planner service.
+        reconcile_interval: Minutes to wait between reconciliation.
     """
 
+    allow_external_contributor: bool = False
     name: str
     extra_labels: list[str]
-    jobmanager_config: jobmanager.JobManagerConfiguration | None
     github_config: github.GitHubConfiguration | None
     service_config: "SupportServiceConfig"
     non_reactive_configuration: "NonReactiveConfiguration"
     reactive_configuration: "ReactiveConfiguration | None"
     openstack_configuration: OpenStackConfiguration
+    planner_url: Optional[AnyHttpUrl] = None
+    planner_token: Optional[str] = None
     reconcile_interval: int
 
     @staticmethod
@@ -81,9 +89,10 @@ class SupportServiceConfig(BaseModel):
         proxy_config: The proxy configuration.
         runner_proxy_config: The proxy configuration for the runner.
         use_aproxy: Whether aproxy should be used for the runners.
+        aproxy_exclude_addresses: A list of addresses to exclude from the aproxy proxy.
+        aproxy_redirect_ports: A list of ports to redirect to the aproxy proxy.
         dockerhub_mirror: The dockerhub mirror to use for runners.
         ssh_debug_connections: The information on the ssh debug services.
-        repo_policy_compliance: The configuration of the repo policy compliance service.
         custom_pre_job_script: The custom pre-job script to run before the job.
     """
 
@@ -91,9 +100,10 @@ class SupportServiceConfig(BaseModel):
     proxy_config: "ProxyConfig | None"
     runner_proxy_config: "ProxyConfig | None"
     use_aproxy: bool
+    aproxy_exclude_addresses: list[str] = []
+    aproxy_redirect_ports: list[str] = []
     dockerhub_mirror: str | None
     ssh_debug_connections: "list[SSHDebugConnection]"
-    repo_policy_compliance: "RepoPolicyComplianceConfig | None"
     custom_pre_job_script: str | None
 
     @root_validator(pre=False, skip_on_failure=True)
@@ -187,18 +197,6 @@ class SSHDebugConnection(BaseModel):
     local_proxy_port: int = 3129
 
 
-class RepoPolicyComplianceConfig(BaseModel):
-    """Configuration for the repo policy compliance service.
-
-    Attributes:
-        token: Token for the repo policy compliance service.
-        url: URL of the repo policy compliance service.
-    """
-
-    token: str
-    url: AnyHttpUrl
-
-
 class NonReactiveConfiguration(BaseModel):
     """Configuration for non-reactive mode.
 
@@ -216,11 +214,36 @@ class NonReactiveCombination(BaseModel):
         image: Information about the image to spawn.
         flavor: Information about the flavor to spawn.
         base_virtual_machines: Number of instances to spawn for this combination.
+        max_total_virtual_machines: Maximum number of instances to spawn. 0 means no cap.
     """
 
     image: "Image"
     flavor: "Flavor"
     base_virtual_machines: int
+    max_total_virtual_machines: int = 0
+
+    @root_validator(pre=False, skip_on_failure=True)
+    @classmethod
+    def check_max_ge_base(cls, values: dict) -> dict:
+        """Validate that max_total_virtual_machines is not below base_virtual_machines.
+
+        Args:
+            values: Values in the pydantic model.
+
+        Raises:
+            ValueError: if max_total_virtual_machines is set but lower than base_virtual_machines.
+
+        Returns:
+            Values in the pydantic model.
+        """
+        max_vms = values.get("max_total_virtual_machines", 0)
+        base_vms = values.get("base_virtual_machines", 0)
+        if 0 < max_vms < base_vms:
+            raise ValueError(
+                f"max_total_virtual_machines ({max_vms}) must be >= base_virtual_machines"
+                f" ({base_vms})"
+            )
+        return values
 
 
 class ReactiveConfiguration(BaseModel):

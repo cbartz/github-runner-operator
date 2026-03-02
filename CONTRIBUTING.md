@@ -23,7 +23,7 @@ The code for this charm can be downloaded as follows:
 git clone https://github.com/canonical/github-runner-operator.git
 ```
 
-Prior to working on the charm ensure juju is connected to an LXD cloud,  see the [upstream documentation](https://juju.is/docs/lxd-cloud) for details.
+Prior to working on the charm ensure juju is connected to an LXD cloud,  see the [upstream documentation](https://documentation.ubuntu.com/juju/3.6/reference/cloud/list-of-supported-clouds/the-lxd-cloud-and-juju/) for details.
 
 
 ### Testing
@@ -42,6 +42,19 @@ that can be used for linting and formatting code when you're preparing contribut
 
 > NOTE: Integration tests are currently intended to run on the CI and may not work locally without further argument.
 
+<!-- vale Canonical.007-Headings-sentence-case = NO -->
+#### CI testing setup guidelines
+<!-- vale Canonical.007-Headings-sentence-case = YES -->
+
+To prefer explicit setting arguments passing, use `extra-arguments` of the
+[following reusable workflow](https://github.com/canonical/operator-workflows/blob/main/.github/workflows/integration_test_run.yaml)
+to pass in non-sensitive values.
+For sensitive values (`INTEGRATION_TOKEN`: `--token`, `OS_PASSWORD`: `--openstack-password`), map
+them via `INTEGRATION_TEST_SECRET_ENV_NAME_<N>`
+environment variable settings under [repository](https://github.com/canonical/github-runner-operator)
+> settings > variables > actions.
+This is to prevent GitHub from leaking secrets when passing them over the CLI calls (unresolved).
+
 ### Building the charm
 
 Build the charm in this git repository using:
@@ -50,6 +63,6 @@ Build the charm in this git repository using:
 charmcraft pack
 ```
 
-## Canonical Contributor Agreement
+## Canonical contributor agreement
 
 Canonical welcomes contributions to the GitHub Runner Operator. Please check out our [contributor agreement](https://ubuntu.com/legal/contributors) if you’re interested in contributing to the solution.

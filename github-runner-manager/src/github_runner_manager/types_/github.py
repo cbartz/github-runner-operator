@@ -1,8 +1,7 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Module containing GitHub API related types."""
-
 
 from __future__ import annotations
 
@@ -48,16 +47,6 @@ class RunnerApplication(BaseModel):
 RunnerApplicationList = List[RunnerApplication]
 
 
-class SelfHostedRunnerLabel(BaseModel):
-    """A single label of self-hosted runners.
-
-    Attributes:
-        name: Name of the label.
-    """
-
-    name: str
-
-
 class SelfHostedRunner(BaseModel):
     """Information on a single self-hosted runner.
 
@@ -74,7 +63,7 @@ class SelfHostedRunner(BaseModel):
     identity: RunnerIdentity
     busy: bool
     id: int
-    labels: list[SelfHostedRunnerLabel]
+    labels: list[str]
     status: GitHubRunnerStatus
     deletable: bool = False
 
@@ -90,7 +79,7 @@ class SelfHostedRunner(BaseModel):
             A SelfHostedRunner from the input data.
         # Pydantic does not correctly parse labels, they are of type fastcore.foundation.L.
         """
-        github_dict["labels"] = list(github_dict["labels"])
+        github_dict["labels"] = [label["name"] for label in github_dict["labels"]]
         github_dict["identity"] = RunnerIdentity(
             instance_id=instance_id,
             metadata=RunnerMetadata(platform_name="github", runner_id=github_dict["id"]),

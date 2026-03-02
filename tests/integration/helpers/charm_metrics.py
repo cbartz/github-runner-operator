@@ -1,4 +1,4 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Utilities for charm metrics integration tests."""
@@ -13,7 +13,7 @@ from github.GithubException import GithubException
 from github.Repository import Repository
 from github.Workflow import Workflow
 from github.WorkflowJob import WorkflowJob
-from github_runner_manager.manager.cloud_runner_manager import PostJobStatus
+from github_runner_manager.manager.vm_manager import PostJobStatus
 from github_runner_manager.metrics.events import METRICS_LOG_PATH
 from github_runner_manager.types_.github import JobConclusion
 from juju.application import Application
@@ -186,9 +186,6 @@ async def assert_events_after_reconciliation(
                     None,
                     JobConclusion.CANCELLED,
                 ]
-            elif post_job_status == PostJobStatus.REPO_POLICY_CHECK_FAILURE:
-                assert metric_log.get("status_info", {}).get("code", 0) == 403
-                assert metric_log.get("job_conclusion") == JobConclusion.FAILURE
             else:
                 assert "status_info" not in metric_log
                 assert metric_log.get("job_conclusion") == JobConclusion.SUCCESS

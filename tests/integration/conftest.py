@@ -1,15 +1,19 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """Fixtures for github runner charm integration tests."""
+
+import json
 import logging
-import os
 import random
+import re
 import secrets
 import string
+import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
-from typing import Any, AsyncIterator, Generator, Iterator, Optional, cast
+from typing import Any, AsyncGenerator, AsyncIterator, Generator, Iterator, Optional, cast
 
 import jubilant
 import nest_asyncio
@@ -19,6 +23,7 @@ import pytest_asyncio
 import yaml
 from git import Repo
 from github import Github, GithubException
+from github.Auth import Token
 from github.Branch import Branch
 from github.Repository import Repository
 from github_runner_manager.github_client import GithubClient
@@ -29,7 +34,9 @@ from openstack.connection import Connection
 from pytest_operator.plugin import OpsTest
 
 from charm_state import (
+    APROXY_REDIRECT_PORTS_CONFIG_NAME,
     BASE_VIRTUAL_MACHINES_CONFIG_NAME,
+    DOCKERHUB_MIRROR_CONFIG_NAME,
     LABELS_CONFIG_NAME,
     OPENSTACK_CLOUDS_YAML_CONFIG_NAME,
     OPENSTACK_FLAVOR_CONFIG_NAME,
@@ -40,10 +47,13 @@ from charm_state import (
 from tests.integration.helpers.common import (
     MONGODB_APP_NAME,
     deploy_github_runner_charm,
+    get_github_runner_manager_service_log,
+    get_github_runner_metrics_log,
+    get_github_runner_reactive_log,
     wait_for,
     wait_for_runner_ready,
 )
-from tests.integration.helpers.openstack import OpenStackInstanceHelper, PrivateEndpointConfigs
+from tests.integration.helpers.openstack import OpenStackInstanceHelper
 from tests.status_name import ACTIVE
 
 DEFAULT_RECONCILE_INTERVAL = 2
@@ -53,6 +63,204 @@ IMAGE_BUILDER_INTEGRATION_TIMEOUT_IN_SECONDS = 30 * 60
 # The following line is required because we are using request.getfixturevalue in conjunction
 # with pytest-asyncio. See https://github.com/pytest-dev/pytest-asyncio/issues/112
 nest_asyncio.apply()
+
+
+@dataclass
+class GitHubConfig:
+    """GitHub configuration for tests.
+
+    Attributes:
+        token: GitHub personal access token.
+        path: GitHub repository path in <owner>/<repo> or <user>/<repo> format.
+    """
+
+    token: str
+    path: str
+
+
+@dataclass
+class OpenStackConfig:
+    """OpenStack configuration for tests.
+
+    Attributes:
+        http_proxy: HTTP proxy for OpenStack runners.
+        https_proxy: HTTPS proxy for OpenStack runners.
+        no_proxy: No proxy configuration for OpenStack runners.
+        network_name: Network to spawn test instances under.
+        flavor_name: Flavor to create testing instances with.
+        auth_url: OpenStack authentication URL (Keystone).
+        password: OpenStack password.
+        project_domain_name: OpenStack project domain to use.
+        project_name: OpenStack project to use within the domain.
+        user_domain_name: OpenStack user domain to use.
+        username: OpenStack user to use within the domain.
+        region_name: OpenStack deployment region.
+        test_image_id: Test image ID for mocking image builder (optional).
+        clouds_yaml_contents: Generated clouds.yaml configuration from OpenStack settings.
+    """
+
+    http_proxy: str
+    https_proxy: str
+    no_proxy: str
+    network_name: str
+    flavor_name: str
+    auth_url: str
+    password: str
+    project_domain_name: str
+    project_name: str
+    user_domain_name: str
+    username: str
+    region_name: str
+    test_image_id: Optional[str] = None
+
+    @property
+    def clouds_yaml_contents(self) -> str:
+        """Generate clouds.yaml contents from configuration."""
+        return string.Template(
+            Path("tests/integration/data/clouds.yaml.tmpl").read_text(encoding="utf-8")
+        ).substitute(
+            {
+                "auth_url": self.auth_url,
+                "password": self.password,
+                "project_domain_name": self.project_domain_name,
+                "project_name": self.project_name,
+                "user_domain_name": self.user_domain_name,
+                "username": self.username,
+                "region_name": self.region_name,
+            }
+        )
+
+
+@dataclass
+class ProxyConfig:
+    """Proxy configuration for tests.
+
+    Attributes:
+        http_proxy: HTTP proxy for runners.
+        https_proxy: HTTPS proxy for runners.
+        no_proxy: No proxy configuration for runners.
+    """
+
+    http_proxy: str
+    https_proxy: str
+    no_proxy: str
+
+
+# Map base token to (charm base, series)
+BASE_SERIES_MAP: dict[str, tuple[str, str]] = {
+    "22.04": ("ubuntu@22.04", "jammy"),
+    "24.04": ("ubuntu@24.04", "noble"),
+}
+
+
+@dataclass
+class CharmArtifact:
+    """Charm build artifact metadata used for selection.
+
+    Attributes:
+        name: Artifact filename relative to the workspace root.
+        base_token: Base identifier extracted from the filename (e.g., '22.04', '24.04').
+    """
+
+    name: str
+    base_token: str
+
+
+@dataclass
+class DeploymentContext:
+    """Deployment parameters derived from the selected artifact.
+
+    Attributes:
+        charm_path: Filesystem path to the selected charm artifact.
+        base: Juju base for deployment (e.g., 'ubuntu@22.04').
+        series: Ubuntu series corresponding to the base (e.g., 'jammy', 'noble').
+    """
+
+    charm_path: str
+    base: str
+    series: str
+
+
+def _parse_base_token(artifact_name: str) -> str:
+    """Extract an Ubuntu base token (e.g., '22.04', '24.04', '26.04') from an artifact name."""
+    ubuntu_match = re.search(r"ubuntu@(?P<base>\d{2}\.\d{2})", artifact_name)
+    assert ubuntu_match, "Base not detected from charm file (e.g., 'github-runner-ubuntu@22.04')"
+    return ubuntu_match.group("base")
+
+
+def resolve_series(base_token: str) -> tuple[str, str]:
+    """Resolve Juju base and Ubuntu series for a given base token.
+
+    Args:
+        base_token: Ubuntu base identifier (e.g., '22.04', '24.04').
+
+    Returns:
+        A tuple of (charm base, series), for example ('ubuntu@22.04', 'jammy').
+
+    Raises:
+        ValueError: if the base token is unknown. Update BASE_SERIES_MAP
+            when new Ubuntu releases are supported.
+    """
+    mapped = BASE_SERIES_MAP.get(base_token)
+    if not mapped:
+        raise ValueError(
+            f"Unknown base token '{base_token}'. Please update BASE_SERIES_MAP to include the corresponding series."
+        )
+    return mapped
+
+
+@pytest.fixture(scope="module")
+def cli_base_option(pytestconfig: pytest.Config) -> str:
+    """Selected base token from `--base` option, defaulting to '22.04'."""
+    return cast(str, pytestconfig.getoption("--base") or "22.04")
+
+
+@pytest.fixture(scope="module")
+def available_charm_files(pytestconfig: pytest.Config) -> list[str]:
+    """List of charm artifact filenames from repeated `--charm-file` options.
+
+    Asserts that at least one artifact is provided.
+    """
+    files: list[str] = cast(list[str], pytestconfig.getoption("--charm-file") or [])
+    assert files, "Please specify one or more --charm-file options"
+    return files
+
+
+@pytest.fixture(scope="module")
+def artifact_catalog(available_charm_files: list[str]) -> list[CharmArtifact]:
+    """Build a catalog of charm artifacts annotated with base tokens."""
+    catalog: list[CharmArtifact] = []
+    for f in available_charm_files:
+        base_token = _parse_base_token(f)
+        catalog.append(CharmArtifact(name=f, base_token=base_token))
+    return catalog
+
+
+@pytest.fixture(scope="module")
+def selected_artifact(
+    cli_base_option: str, artifact_catalog: list[CharmArtifact]
+) -> CharmArtifact:
+    """Choose the artifact matching the `--base` option."""
+    for art in artifact_catalog:
+        if art.base_token == cli_base_option:
+            return art
+    raise ValueError(
+        "No charm artifact found matching the specified base token. Please check your --charm-file options."
+    )
+
+
+@pytest.fixture(scope="module")
+def deployment_context(selected_artifact: CharmArtifact) -> DeploymentContext:
+    """Construct the deployment context (base, series) for the selected artifact.
+
+    Fails fast if the base token isn't mapped to a known series.
+    """
+    base, series = resolve_series(selected_artifact.base_token)
+    return DeploymentContext(
+        charm_path=f"./{selected_artifact.name}",
+        base=base,
+        series=series,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -91,223 +299,152 @@ def image_builder_app_name(random_app_name_suffix: str) -> str:
     return f"github-runner-image-builder-{random_app_name_suffix}"
 
 
-@pytest.fixture(scope="module", name="openstack_clouds_yaml")
-def openstack_clouds_yaml_fixture(pytestconfig: pytest.Config) -> str | None:
-    """The openstack clouds yaml config."""
-    return pytestconfig.getoption("--openstack-clouds-yaml")
-
-
 @pytest.fixture(scope="module")
-def charm_file(pytestconfig: pytest.Config, openstack_clouds_yaml: Optional[str]) -> str:
-    """Path to the built charm."""
-    charm = pytestconfig.getoption("--charm-file")
-    assert charm, "Please specify the --charm-file command line option"
-    charm_path_str = f"./{charm}"
+def github_config(pytestconfig: pytest.Config) -> GitHubConfig:
+    """Github configuration for tests.
 
-    return charm_path_str
+    Args:
+        pytestconfig: Pytest configuration object.
 
+    Returns:
+        GitHub configuration object.
+    """
+    token = pytestconfig.getoption("--token")
+    assert token, "Please specify the --token command line option"
+    tokens = {token.strip() for token in token.split(",")}
+    random_token = random.choice(list(tokens))
 
-@pytest.fixture(scope="module")
-def path(pytestconfig: pytest.Config) -> str:
-    """Configured path setting."""
     path = pytestconfig.getoption("--path")
     assert path, (
         "Please specify the --path command line option with repository "
         "path of <org>/<repo> or <user>/<repo> format."
     )
-    return path
+
+    return GitHubConfig(token=random_token, path=path)
 
 
 @pytest.fixture(scope="module")
-def token(pytestconfig: pytest.Config) -> str:
-    """Configured token setting."""
-    token = pytestconfig.getoption("--token") or os.environ.get("INTEGRATION_TOKEN")
-    assert token, "Please specify the --token command line option"
-    tokens = {token.strip() for token in token.split(",")}
-    random_token = random.choice(list(tokens))
-    return random_token
+def proxy_config(pytestconfig: pytest.Config) -> ProxyConfig:
+    """Proxy configuration for tests.
 
+    Args:
+        pytestconfig: Pytest configuration object.
 
-@pytest.fixture(scope="module")
-def token_alt(pytestconfig: pytest.Config, token: str) -> str:
-    """Configured token_alt setting."""
-    token_alt = pytestconfig.getoption("--token-alt") or os.environ.get("INTEGRATION_TOKEN_ALT")
-    assert token_alt, (
-        "Please specify the --token-alt command line option with GitHub Personal "
-        "Access Token value."
-    )
-    assert token_alt != token, "Please specify a different token for --token-alt"
-    return token_alt
-
-
-@pytest.fixture(scope="module")
-def http_proxy(pytestconfig: pytest.Config) -> str:
-    """Configured http_proxy setting."""
+    Returns:
+        Proxy configuration object.
+    """
     http_proxy = pytestconfig.getoption("--http-proxy")
-    return "" if http_proxy is None else http_proxy
-
-
-@pytest.fixture(scope="module")
-def https_proxy(pytestconfig: pytest.Config) -> str:
-    """Configured https_proxy setting."""
     https_proxy = pytestconfig.getoption("--https-proxy")
-    return "" if https_proxy is None else https_proxy
+    no_proxy = pytestconfig.getoption("--no-proxy")
+
+    return ProxyConfig(
+        http_proxy="" if http_proxy is None else http_proxy,
+        https_proxy="" if https_proxy is None else https_proxy,
+        no_proxy="" if no_proxy is None else no_proxy,
+    )
 
 
 @pytest.fixture(scope="module")
-def no_proxy(pytestconfig: pytest.Config) -> str:
-    """Configured no_proxy setting."""
-    no_proxy = pytestconfig.getoption("--no-proxy")
-    return "" if no_proxy is None else no_proxy
+def openstack_config(pytestconfig: pytest.Config) -> OpenStackConfig:
+    """Openstack configuration for tests.
 
+    Args:
+        pytestconfig: Pytest configuration object.
 
-@pytest.fixture(scope="module", name="openstack_http_proxy")
-def openstack_http_proxy_fixture(pytestconfig: pytest.Config) -> str:
-    """Configured http_proxy setting for openstack runners."""
+    Returns:
+        OpenStack configuration object.
+    """
     http_proxy = pytestconfig.getoption("--openstack-http-proxy")
-    return "" if http_proxy is None else http_proxy
-
-
-@pytest.fixture(scope="module", name="openstack_https_proxy")
-def openstack_https_proxy_fixture(pytestconfig: pytest.Config) -> str:
-    """Configured https_proxy setting for openstack runners."""
     https_proxy = pytestconfig.getoption("--openstack-https-proxy")
-    return "" if https_proxy is None else https_proxy
-
-
-@pytest.fixture(scope="module", name="openstack_no_proxy")
-def openstack_no_proxy_fixture(pytestconfig: pytest.Config) -> str:
-    """Configured no_proxy setting for openstack runners."""
     no_proxy = pytestconfig.getoption("--openstack-no-proxy")
-    return "" if no_proxy is None else no_proxy
 
+    network_name = pytestconfig.getoption("--openstack-network-name")
+    assert network_name, "Please specify the --openstack-network-name command line option"
 
-@pytest.fixture(scope="module", name="private_endpoint_config")
-def private_endpoint_config_fixture(pytestconfig: pytest.Config) -> PrivateEndpointConfigs | None:
-    """The private endpoint configuration values."""
-    auth_url = pytestconfig.getoption("--openstack-auth-url-amd64")
-    password = pytestconfig.getoption("--openstack-password-amd64")
-    password = password or os.environ.get("INTEGRATION_OPENSTACK_PASSWORD_AMD64")
+    flavor_name = pytestconfig.getoption("--openstack-flavor-name")
+    assert flavor_name, "Please specify the --openstack-flavor-name command line option"
+
+    # OpenStack authentication details
+    auth_url = pytestconfig.getoption("--openstack-auth-url")
+    password = pytestconfig.getoption("--openstack-password")
     assert (
         password
-    ), "Please specify the --openstack-password-amd64 option or INTEGRATION_OPENSTACK_PASSWORD_AMD64 environment variable"
-    project_domain_name = pytestconfig.getoption("--openstack-project-domain-name-amd64")
-    project_name = pytestconfig.getoption("--openstack-project-name-amd64")
-    user_domain_name = pytestconfig.getoption("--openstack-user-domain-name-amd64")
-    user_name = pytestconfig.getoption("--openstack-username-amd64")
-    region_name = pytestconfig.getoption("--openstack-region-name-amd64")
-    if any(
-        not val
-        for val in (
+    ), "Please specify the --openstack-password option or OS_PASSWORD environment variable"
+    project_domain_name = pytestconfig.getoption("--openstack-project-domain-name")
+    project_name = pytestconfig.getoption("--openstack-project-name")
+    user_domain_name = pytestconfig.getoption("--openstack-user-domain-name")
+    username = pytestconfig.getoption("--openstack-username")
+    region_name = pytestconfig.getoption("--openstack-region-name")
+
+    assert all(
+        [
             auth_url,
             password,
             project_domain_name,
             project_name,
             user_domain_name,
-            user_name,
+            username,
             region_name,
-        )
-    ):
-        return None
-    return {
-        "auth_url": auth_url,
-        "password": str(password),
-        "project_domain_name": project_domain_name,
-        "project_name": project_name,
-        "user_domain_name": user_domain_name,
-        "username": user_name,
-        "region_name": region_name,
-    }
+        ]
+    ), "Specify all OpenStack private endpoint options."
 
+    test_image_id = pytestconfig.getoption("--openstack-image-id")
 
-@pytest.fixture(scope="module", name="private_endpoint_clouds_yaml")
-def private_endpoint_clouds_yaml_fixture(
-    private_endpoint_config: PrivateEndpointConfigs | None,
-) -> Optional[str]:
-    """The openstack private endpoint clouds yaml."""
-    if not private_endpoint_config:
-        return None
-    return string.Template(
-        Path("tests/integration/data/clouds.yaml.tmpl").read_text(encoding="utf-8")
-    ).substitute(
-        {
-            "auth_url": private_endpoint_config["auth_url"],
-            "password": private_endpoint_config["password"],
-            "project_domain_name": private_endpoint_config["project_domain_name"],
-            "project_name": private_endpoint_config["project_name"],
-            "user_domain_name": private_endpoint_config["user_domain_name"],
-            "username": private_endpoint_config["username"],
-            "region_name": private_endpoint_config["region_name"],
-        }
+    return OpenStackConfig(
+        http_proxy="" if http_proxy is None else http_proxy,
+        https_proxy="" if https_proxy is None else https_proxy,
+        no_proxy="" if no_proxy is None else no_proxy,
+        network_name=network_name,
+        flavor_name=flavor_name,
+        auth_url=auth_url,
+        password=str(password),
+        project_domain_name=project_domain_name,
+        project_name=project_name,
+        user_domain_name=user_domain_name,
+        username=username,
+        region_name=region_name,
+        test_image_id=test_image_id,
     )
 
 
-@pytest.fixture(scope="module", name="clouds_yaml_contents")
-def clouds_yaml_contents_fixture(
-    openstack_clouds_yaml: Optional[str], private_endpoint_clouds_yaml: Optional[str]
-):
-    """The Openstack clouds yaml or private endpoint cloud yaml contents."""
-    clouds_yaml_contents = openstack_clouds_yaml or private_endpoint_clouds_yaml
-    assert clouds_yaml_contents, (
-        "Please specify --openstack-clouds-yaml or all of private endpoint arguments "
-        "(--openstack-auth-url, --openstack-password, --openstack-project-domain-name, "
-        "--openstack-project-name, --openstack-user-domain-name, --openstack-user-name, "
-        "--openstack-region-name)"
-    )
-    return clouds_yaml_contents
+@pytest.fixture(scope="module")
+def dockerhub_mirror(pytestconfig: pytest.Config) -> Optional[str]:
+    """The dockerhub mirror URL for tests.
 
-
-@pytest.fixture(scope="module", name="network_name")
-def network_name_fixture(pytestconfig: pytest.Config) -> str:
-    """Network to use to spawn test instances under."""
-    network_name = pytestconfig.getoption("--openstack-network-name-amd64")
-    assert network_name, "Please specify the --openstack-network-name-amd64 command line option"
-    return network_name
-
-
-@pytest.fixture(scope="module", name="flavor_name")
-def flavor_name_fixture(pytestconfig: pytest.Config) -> str:
-    """Flavor to create testing instances with."""
-    flavor_name = pytestconfig.getoption("--openstack-flavor-name-amd64")
-    assert flavor_name, "Please specify the --openstack-flavor-name command line option"
-    return flavor_name
-
-
-@pytest.fixture(scope="module", name="openstack_test_image")
-def openstack_test_image_fixture(pytestconfig: pytest.Config) -> str:
-    """Image for testing openstack interfaces."""
-    test_image = pytestconfig.getoption("--openstack-test-image")
-    assert test_image, "Please specify the --openstack-test-image command line option"
-    return test_image
-
-
-@pytest.fixture(scope="module", name="openstack_test_flavor")
-def openstack_test_flavor_fixture(pytestconfig: pytest.Config) -> str:
-    """Flavor for testing openstack interfaces."""
-    test_flavor = pytestconfig.getoption("--openstack-test-flavor")
-    assert test_flavor, "Please specify the --openstack-test-flavor command line option"
-    return test_flavor
+    Returns:
+        The dockerhub mirror URL if provided, None otherwise.
+    """
+    return pytestconfig.getoption("--dockerhub-mirror")
 
 
 @pytest.fixture(scope="module", name="openstack_connection")
 def openstack_connection_fixture(
-    clouds_yaml_contents: str,
+    openstack_config: OpenStackConfig,
     app_name: str,
     existing_app_suffix: str,
+    request: pytest.FixtureRequest,
 ) -> Generator[Connection, None, None]:
     """The openstack connection instance."""
-    clouds_yaml = yaml.safe_load(clouds_yaml_contents)
+    clouds_yaml = yaml.safe_load(openstack_config.clouds_yaml_contents)
     clouds_yaml_path = Path.cwd() / "clouds.yaml"
-    clouds_yaml_path.write_text(data=clouds_yaml_contents, encoding="utf-8")
+    clouds_yaml_path.write_text(data=openstack_config.clouds_yaml_contents, encoding="utf-8")
     first_cloud = next(iter(clouds_yaml["clouds"].keys()))
     with openstack.connect(first_cloud) as connection:
         yield connection
+
+    servers = connection.list_servers(filters={"name": app_name})
+
+    if request.session.testsfailed:
+        logging.info("OpenStack servers: %s", servers)
+        for server in servers:
+            console_log = connection.get_server_console(server=server)
+            logging.info("Server %s console log:\n%s", server.name, console_log)
 
     if not existing_app_suffix:
         # servers, keys, security groups, security rules, images are created by the charm.
         # don't remove security groups & rules since they are single instances.
         # don't remove images since it will be moved to image-builder
-        for server in connection.list_servers():
+        for server in servers:
             server_name: str = server.name
             if server_name.startswith(app_name):
                 connection.delete_server(server_name)
@@ -318,22 +455,22 @@ def openstack_connection_fixture(
 
 
 @pytest_asyncio.fixture(scope="module")
-async def model(ops_test: OpsTest, http_proxy: str, https_proxy: str, no_proxy: str) -> Model:
+async def model(ops_test: OpsTest, proxy_config: ProxyConfig) -> Model:
     """Juju model used in the test."""
     assert ops_test.model is not None
     await ops_test.model.set_config(
         {
-            "juju-http-proxy": http_proxy,
-            "juju-https-proxy": https_proxy,
-            "juju-no-proxy": no_proxy,
+            "juju-http-proxy": proxy_config.http_proxy,
+            "juju-https-proxy": proxy_config.https_proxy,
+            "juju-no-proxy": proxy_config.no_proxy,
         }
     )
     return ops_test.model
 
 
 @pytest.fixture(scope="module")
-def runner_manager_github_client(token: str) -> GithubClient:
-    return GithubClient(token=token)
+def runner_manager_github_client(github_config: GitHubConfig) -> GithubClient:
+    return GithubClient(token=github_config.token)
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -349,16 +486,14 @@ async def app_no_runner(
 
 @pytest_asyncio.fixture(scope="module")
 async def openstack_model_proxy(
-    openstack_http_proxy: str,
-    openstack_https_proxy: str,
-    openstack_no_proxy: str,
+    openstack_config: OpenStackConfig,
     model: Model,
 ) -> None:
     await model.set_config(
         {
-            "juju-http-proxy": openstack_http_proxy,
-            "juju-https-proxy": openstack_https_proxy,
-            "juju-no-proxy": openstack_no_proxy,
+            "juju-http-proxy": openstack_config.http_proxy,
+            "juju-https-proxy": openstack_config.https_proxy,
+            "juju-no-proxy": openstack_config.no_proxy,
             "logging-config": "<root>=INFO;unit=INFO",
         }
     )
@@ -366,25 +501,21 @@ async def openstack_model_proxy(
 
 @pytest_asyncio.fixture(scope="module", name="image_builder_config")
 async def image_builder_config_fixture(
-    private_endpoint_config: PrivateEndpointConfigs | None,
-    flavor_name: str,
-    network_name: str,
+    openstack_config: OpenStackConfig,
 ):
     """The image builder application default for OpenStack runners."""
-    if not private_endpoint_config:
-        raise ValueError("Private endpoints are required for testing OpenStack runners.")
     return {
         "build-interval": "12",
         "revision-history-limit": "2",
-        "openstack-auth-url": private_endpoint_config["auth_url"],
+        "openstack-auth-url": openstack_config.auth_url,
         # Bandit thinks this is a hardcoded password
-        "openstack-password": private_endpoint_config["password"],  # nosec: B105
-        "openstack-project-domain-name": private_endpoint_config["project_domain_name"],
-        "openstack-project-name": private_endpoint_config["project_name"],
-        "openstack-user-domain-name": private_endpoint_config["user_domain_name"],
-        "openstack-user-name": private_endpoint_config["username"],
-        "build-flavor": flavor_name,
-        "build-network": network_name,
+        "openstack-password": openstack_config.password,  # nosec: B105
+        "openstack-project-domain-name": openstack_config.project_domain_name,
+        "openstack-project-name": openstack_config.project_name,
+        "openstack-user-domain-name": openstack_config.user_domain_name,
+        "openstack-user-name": openstack_config.username,
+        "build-flavor": openstack_config.flavor_name,
+        "build-network": openstack_config.network_name,
         "architecture": "amd64",
     }
 
@@ -394,49 +525,93 @@ async def image_builder_fixture(
     model: Model,
     existing_app_suffix: Optional[str],
     image_builder_app_name: str,
+    openstack_config: OpenStackConfig,
     image_builder_config: dict,
-    flavor_name: str,
-    network_name: str,
-    openstack_model_proxy: None,
     openstack_connection,
+    request: pytest.FixtureRequest,
 ):
-    """The image builder application for OpenStack runners."""
-    if not existing_app_suffix:
-        application_name = image_builder_app_name
-        app = await model.deploy(
+    """The image builder application for OpenStack runners.
+
+    If openstack_config.test_image_id is provided, uses any-charm to mock the image relation.
+    Otherwise, deploys the real github-runner-image-builder charm.
+    """
+    if existing_app_suffix:
+        logging.info("Using existing image builder %s", image_builder_app_name)
+        yield model.applications[image_builder_app_name]
+        return
+
+    if not openstack_config.test_image_id:
+        logging.info("Deploying image builder %s", image_builder_app_name)
+        # Deploy the real github-runner-image-builder
+        yield await model.deploy(
             "github-runner-image-builder",
-            application_name=application_name,
+            application_name=image_builder_app_name,
             channel="latest/edge",
             config=image_builder_config,
+            constraints={
+                "root-disk": 20 * 1024,
+                "mem": 2 * 1024,
+                # 2025-11-26: Set deployment type to virtual-machine due to bug with snapd. See:
+                # https://github.com/canonical/snapd/pull/16131
+                "virt-type": "virtual-machine",
+                "cores": 2,
+            },
         )
-    else:
-        app = model.applications[image_builder_app_name]
-    yield app
 
-    if not existing_app_suffix:
         # The github-image-builder does not clean keypairs. Until it does,
         # we clean them manually here.
+        logging.info("Cleaning up image builder resources...")
         for key in openstack_connection.list_keypairs():
             key_name: str = key.name
             if key_name.startswith(image_builder_app_name):
                 openstack_connection.delete_keypair(key_name)
 
+        return
+
+    # Use any-charm to mock the image relation provider
+    # Determine series based on selected deployment context
+    dep_ctx: DeploymentContext = request.getfixturevalue("deployment_context")
+    series = dep_ctx.series
+
+    any_charm_src_overwrite = {
+        "any_charm.py": textwrap.dedent(f"""\
+            from any_charm_base import AnyCharmBase
+
+            class AnyCharm(AnyCharmBase):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.framework.observe(self.on['provide-github-runner-image-v0'].\
+relation_changed, self._image_relation_changed)
+
+                def _image_relation_changed(self, event):
+                    # Provide mock image relation data
+                    event.relation.data[self.unit]['id'] = '{openstack_config.test_image_id}'
+                    event.relation.data[self.unit]['tags'] = '{series}, amd64'
+            """),
+    }
+    logging.info(
+        "Deploying fake image builder via any-charm for image ID %s",
+        openstack_config.test_image_id,
+    )
+    yield await model.deploy(
+        "any-charm",
+        application_name=image_builder_app_name,
+        channel="latest/beta",
+        config={"src-overwrite": json.dumps(any_charm_src_overwrite)},
+    )
+
 
 @pytest_asyncio.fixture(scope="module", name="app_openstack_runner")
 async def app_openstack_runner_fixture(
     model: Model,
-    charm_file: str,
+    deployment_context: DeploymentContext,
     app_name: str,
-    path: str,
-    token: str,
-    openstack_http_proxy: str,
-    openstack_https_proxy: str,
-    openstack_no_proxy: str,
-    clouds_yaml_contents: str,
-    network_name: str,
-    flavor_name: str,
+    github_config: GitHubConfig,
+    openstack_config: OpenStackConfig,
     existing_app_suffix: Optional[str],
     image_builder: Application,
+    dockerhub_mirror: Optional[str],
+    request: pytest.FixtureRequest,
 ) -> AsyncIterator[Application]:
     """Application launching VMs and no runners."""
     if existing_app_suffix:
@@ -444,35 +619,48 @@ async def app_openstack_runner_fixture(
     else:
         application = await deploy_github_runner_charm(
             model=model,
-            charm_file=charm_file,
+            charm_file=deployment_context.charm_path,
             app_name=app_name,
-            path=path,
-            token=token,
-            http_proxy=openstack_http_proxy,
-            https_proxy=openstack_https_proxy,
-            no_proxy=openstack_no_proxy,
+            github_config=github_config,
+            proxy_config=ProxyConfig(
+                http_proxy=openstack_config.http_proxy,
+                https_proxy=openstack_config.https_proxy,
+                no_proxy=openstack_config.no_proxy,
+            ),
             reconcile_interval=DEFAULT_RECONCILE_INTERVAL,
-            constraints={
-                "root-disk": 50 * 1024,
-                "mem": 2 * 1024,
-            },
+            constraints={"root-disk": 50 * 1024, "mem": 2 * 1024, "virt-type": "virtual-machine"},
             config={
-                OPENSTACK_CLOUDS_YAML_CONFIG_NAME: clouds_yaml_contents,
-                OPENSTACK_NETWORK_CONFIG_NAME: network_name,
-                OPENSTACK_FLAVOR_CONFIG_NAME: flavor_name,
-                USE_APROXY_CONFIG_NAME: bool(openstack_http_proxy),
+                OPENSTACK_CLOUDS_YAML_CONFIG_NAME: openstack_config.clouds_yaml_contents,
+                OPENSTACK_NETWORK_CONFIG_NAME: openstack_config.network_name,
+                OPENSTACK_FLAVOR_CONFIG_NAME: openstack_config.flavor_name,
+                USE_APROXY_CONFIG_NAME: bool(openstack_config.http_proxy),
+                APROXY_REDIRECT_PORTS_CONFIG_NAME: "1-3127,3129-65535",
                 LABELS_CONFIG_NAME: app_name,
+                **({DOCKERHUB_MIRROR_CONFIG_NAME: dockerhub_mirror} if dockerhub_mirror else {}),
             },
+            base=deployment_context.base,
+            series=deployment_context.series,
             wait_idle=False,
         )
-        await model.integrate(f"{image_builder.name}:image", f"{application.name}:image")
+        await model.integrate(image_builder.name, f"{application.name}:image")
     await model.wait_for_idle(
         apps=[application.name, image_builder.name],
         status=ACTIVE,
         timeout=IMAGE_BUILDER_INTEGRATION_TIMEOUT_IN_SECONDS,
     )
 
-    return application
+    yield application
+
+    if request.session.testsfailed:
+        try:
+            app_log = await get_github_runner_manager_service_log(unit=application.units[0])
+            logging.info("Application log: \n%s", app_log)
+            reactive_log = await get_github_runner_reactive_log(unit=application.units[0])
+            logging.info("Reactive log: \n%s", reactive_log)
+            metrics_log = await get_github_runner_metrics_log(unit=application.units[0])
+            logging.info("Metrics log: \n%s", metrics_log)
+        except AssertionError:
+            logging.warning("Failed to get application log.", exc_info=True)
 
 
 @pytest_asyncio.fixture(scope="module", name="app_scheduled_events")
@@ -489,40 +677,25 @@ async def app_scheduled_events_fixture(
     return application
 
 
-@pytest_asyncio.fixture(scope="module", name="app_no_wait_tmate")
-async def app_no_wait_tmate_fixture(
-    model: Model,
-    app_openstack_runner,
-):
-    """Application to check tmate ssh with openstack without waiting for active."""
-    application = app_openstack_runner
-    await application.set_config({BASE_VIRTUAL_MACHINES_CONFIG_NAME: "1"})
-    return application
-
-
 @pytest_asyncio.fixture(scope="module")
 async def app_runner(
     model: Model,
-    charm_file: str,
+    deployment_context: DeploymentContext,
     app_name: str,
-    path: str,
-    token: str,
-    http_proxy: str,
-    https_proxy: str,
-    no_proxy: str,
+    github_config: GitHubConfig,
+    proxy_config: ProxyConfig,
 ) -> AsyncIterator[Application]:
     """Application to test runners."""
     # Use a different app_name so workflows can select runners from this deployment.
     application = await deploy_github_runner_charm(
         model=model,
-        charm_file=charm_file,
+        charm_file=deployment_context.charm_path,
         app_name=f"{app_name}-test",
-        path=path,
-        token=token,
-        http_proxy=http_proxy,
-        https_proxy=https_proxy,
-        no_proxy=no_proxy,
+        github_config=github_config,
+        proxy_config=proxy_config,
         reconcile_interval=1,
+        base=deployment_context.base,
+        series=deployment_context.series,
     )
     return application
 
@@ -530,25 +703,21 @@ async def app_runner(
 @pytest_asyncio.fixture(scope="module", name="app_no_wait")
 async def app_no_wait_fixture(
     model: Model,
-    charm_file: str,
+    deployment_context: DeploymentContext,
     app_name: str,
-    path: str,
-    token: str,
-    http_proxy: str,
-    https_proxy: str,
-    no_proxy: str,
+    github_config: GitHubConfig,
+    proxy_config: ProxyConfig,
 ) -> AsyncIterator[Application]:
     """Github runner charm application without waiting for active."""
     app: Application = await deploy_github_runner_charm(
         model=model,
-        charm_file=charm_file,
+        charm_file=deployment_context.charm_path,
         app_name=app_name,
-        path=path,
-        token=token,
-        http_proxy=http_proxy,
-        https_proxy=https_proxy,
-        no_proxy=no_proxy,
+        github_config=github_config,
+        proxy_config=proxy_config,
         reconcile_interval=1,
+        base=deployment_context.base,
+        series=deployment_context.series,
         wait_idle=False,
     )
     await app.set_config({BASE_VIRTUAL_MACHINES_CONFIG_NAME: "1"})
@@ -556,14 +725,15 @@ async def app_no_wait_fixture(
 
 
 @pytest_asyncio.fixture(scope="module", name="tmate_ssh_server_app")
-async def tmate_ssh_server_app_fixture(
-    model: Model, app_no_wait_tmate: Application
-) -> AsyncIterator[Application]:
+async def tmate_ssh_server_app_fixture(model: Model) -> AsyncIterator[Application]:
     """tmate-ssh-server charm application related to GitHub-Runner app charm."""
-    tmate_app: Application = await model.deploy("tmate-ssh-server", channel="edge")
-    await app_no_wait_tmate.relate("debug-ssh", f"{tmate_app.name}:debug-ssh")
-    await model.wait_for_idle(apps=[tmate_app.name], status=ACTIVE, timeout=60 * 30)
-
+    tmate_app: Application = await model.deploy(
+        "tmate-ssh-server",
+        channel="edge",
+        # 2025-11-26: Set deployment type to virtual-machine due to bug with snapd. See:
+        # https://github.com/canonical/snapd/pull/16131
+        constraints={"virt-type": "virtual-machine"},
+    )
     return tmate_app
 
 
@@ -587,18 +757,18 @@ async def tmate_ssh_server_unit_ip_fixture(
 
 
 @pytest.fixture(scope="module")
-def github_client(token: str) -> Github:
+def github_client(github_config: GitHubConfig) -> Github:
     """Returns the github client."""
-    gh = Github(token)
+    gh = Github(auth=Token(token=github_config.token))
     rate_limit = gh.get_rate_limit()
-    logging.info("GitHub token rate limit: %s", rate_limit.core)
+    logging.info("GitHub token rate limit: %s", rate_limit.rate)
     return gh
 
 
 @pytest.fixture(scope="module")
-def github_repository(github_client: Github, path: str) -> Repository:
+def github_repository(github_client: Github, github_config: GitHubConfig) -> Repository:
     """Returns client to the Github repository."""
-    return github_client.get_repo(path)
+    return github_client.get_repo(github_config.path)
 
 
 @pytest.fixture(scope="module")
@@ -606,6 +776,8 @@ def forked_github_repository(
     github_repository: Repository,
 ) -> Iterator[Repository]:
     """Create a fork for a GitHub repository."""
+    # After fork creation, the repository workflow run must be enabled manually. Otherwise, a 404
+    # on the workflow get API will be returned.
     forked_repository = github_repository.create_fork(name=f"test-{github_repository.name}")
 
     # Wait for repo to be ready
@@ -713,7 +885,13 @@ async def app_for_metric_fixture(
 async def mongodb_fixture(model: Model, existing_app_suffix: str | None) -> Application:
     """Deploy MongoDB."""
     if not existing_app_suffix:
-        mongodb = await model.deploy(MONGODB_APP_NAME, channel="6/edge")
+        mongodb = await model.deploy(
+            MONGODB_APP_NAME,
+            channel="6/edge",
+            # 2025-11-26: Set deployment type to virtual-machine due to bug with snapd. See:
+            # https://github.com/canonical/snapd/pull/16131
+            constraints={"virt-type": "virtual-machine"},
+        )
     else:
         mongodb = model.applications["mongodb"]
     return mongodb
@@ -748,8 +926,10 @@ async def instance_helper_fixture(request: pytest.FixtureRequest) -> OpenStackIn
     return OpenStackInstanceHelper(openstack_connection=openstack_connection)
 
 
-@pytest.fixture(scope="module")
-def juju(request: pytest.FixtureRequest, model: Model) -> Generator[jubilant.Juju, None, None]:
+@pytest_asyncio.fixture(scope="module")
+async def juju(
+    request: pytest.FixtureRequest, model: Model
+) -> AsyncGenerator[jubilant.Juju, None]:
     """Pytest fixture that wraps :meth:`jubilant.with_model`."""
 
     def show_debug_log(juju: jubilant.Juju):
@@ -762,15 +942,68 @@ def juju(request: pytest.FixtureRequest, model: Model) -> Generator[jubilant.Juj
             log = juju.debug_log(limit=1000)
             print(log, end="")
 
+    controller = await model.get_controller()
     if model:
-        juju = jubilant.Juju(model=model.name)
+        # Currently juju has no way of switching controller context, this is required to operate
+        # in the right controller's right model when using multiple controllers.
+        # See: https://github.com/canonical/jubilant/issues/158
+        juju = jubilant.Juju(model=f"{controller.controller_name}:{model.name}")
         yield juju
         show_debug_log(juju)
         return
 
     keep_models = cast(bool, request.config.getoption("--keep-models"))
-    with jubilant.temp_model(keep=keep_models) as juju:
+    with jubilant.temp_model(keep=keep_models, controller=controller.controller_name) as juju:
+        juju.model = f"{controller.controller_name}:{juju.model}"
         juju.wait_timeout = 10 * 60
         yield juju
         show_debug_log(juju)
         return
+
+
+@pytest.fixture(scope="module")
+def planner_token_secret_name() -> str:
+    """Planner token secret name."""
+    return "planner-token-secret"
+
+
+@pytest_asyncio.fixture(scope="module")
+async def planner_token_secret(model: Model, planner_token_secret_name: str) -> str:
+    """Create a planner token secret."""
+    return await model.add_secret(
+        name=planner_token_secret_name, data_args=["token=MOCK_PLANNER_TOKEN"]
+    )
+
+
+@pytest_asyncio.fixture(scope="module")
+async def mock_planner_app(model: Model, planner_token_secret) -> AsyncIterator[Application]:
+    """Deploy a minimal any-charm that acts as the requires side of the planner relation."""
+    planner_name = "planner"
+
+    any_charm_src_overwrite = {
+        "any_charm.py": textwrap.dedent(f"""\
+            from any_charm_base import AnyCharmBase
+
+            class AnyCharm(AnyCharmBase):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.framework.observe(
+                        self.on["provide-github-runner-planner-v0"].relation_changed,
+                        self._on_planner_relation_changed,
+                    )
+
+                def _on_planner_relation_changed(self, event):
+                    event.relation.data[self.app]["endpoint"] = "http://mock:8080"
+                    event.relation.data[self.app]["token"] = "{planner_token_secret}"
+            """),
+    }
+
+    planner_app: Application = await model.deploy(
+        "any-charm",
+        planner_name,
+        channel="latest/beta",
+        config={"src-overwrite": json.dumps(any_charm_src_overwrite)},
+    )
+
+    await model.wait_for_idle(apps=[planner_app.name], status=ACTIVE, timeout=10 * 60)
+    yield planner_app

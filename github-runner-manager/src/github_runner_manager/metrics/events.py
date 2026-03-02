@@ -1,17 +1,19 @@
-# Copyright 2025 Canonical Ltd.
+# Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
 
 """Models and functions for the metric events."""
+
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, NonNegativeFloat
 
 from github_runner_manager.errors import IssueMetricEventError
-from github_runner_manager.manager.cloud_runner_manager import CodeInformation
+from github_runner_manager.manager.vm_manager import CodeInformation
 
-METRICS_LOG_PATH = Path("/var/log/github-runner-metrics.log")
+METRICS_LOG_PATH = Path(os.getenv("METRICS_LOG_PATH", "/var/log/github-runner-metrics.log"))
 
 
 logger = logging.getLogger(__name__)

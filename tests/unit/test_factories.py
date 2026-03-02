@@ -1,7 +1,8 @@
-#  Copyright 2025 Canonical Ltd.
+#  Copyright 2026 Canonical Ltd.
 #  See LICENSE file for licensing details.
-import pytest
-from github_runner_manager.configuration import (
+import dataclasses
+
+from github_runner_manager.configuration.base import (
     ApplicationConfiguration,
     Flavor,
     Image,
@@ -10,7 +11,6 @@ from github_runner_manager.configuration import (
     ProxyConfig,
     QueueConfig,
     ReactiveConfiguration,
-    RepoPolicyComplianceConfig,
     SSHDebugConnection,
     SupportServiceConfig,
 )
@@ -26,23 +26,8 @@ import charm_state
 import factories
 
 
-@pytest.mark.parametrize(
-    "with_github_config, expected_github_config",
-    [
-        pytest.param(
-            True,
-            GitHubConfiguration(
-                token="githubtoken", path=GitHubOrg(org="canonical", group="group")
-            ),
-            id="with_github_config",
-        ),
-        pytest.param(False, None, id="without_github_config"),
-    ],
-)
 def test_create_application_configuration(
     complete_charm_state: charm_state.CharmState,
-    with_github_config: bool,
-    expected_github_config: GitHubConfiguration | None,
 ):
     """
     arrange: Prepare a fully populated CharmState.
@@ -51,16 +36,15 @@ def test_create_application_configuration(
     """
     state = complete_charm_state
 
-    if not with_github_config:
-        state.charm_config.path = None
-        state.charm_config.token = None
-
     app_configuration = factories.create_application_configuration(state, "app_name", "unit_name")
 
     assert app_configuration == ApplicationConfiguration(
+        allow_external_contributor=False,
         name="app_name",
         extra_labels=["label1", "label2"],
-        github_config=expected_github_config,
+        github_config=GitHubConfiguration(
+            token="githubtoken", path=GitHubOrg(org="canonical", group="group")
+        ),
         service_config=SupportServiceConfig(
             manager_proxy_command="ssh -W %h:%p example.com",
             proxy_config=ProxyConfig(
@@ -86,10 +70,6 @@ def test_create_application_configuration(
                     local_proxy_port=3129,
                 )
             ],
-            repo_policy_compliance=RepoPolicyComplianceConfig(
-                token="token",
-                url="https://compliance.example.com",
-            ),
         ),
         non_reactive_configuration=NonReactiveConfiguration(
             combinations=[
@@ -97,6 +77,7 @@ def test_create_application_configuration(
                     image=Image(name="image_id", labels=["arm64", "noble"]),
                     flavor=Flavor(name="flavor", labels=["flavorlabel"]),
                     base_virtual_machines=1,
+                    max_total_virtual_machines=2,
                 )
             ]
         ),
@@ -157,3 +138,25 @@ def test_create_openstack_configuration(complete_charm_state: charm_state.CharmS
             region_name="region",
         ),
     )
+
+
+def test_create_application_configuration_with_planner(
+    complete_charm_state: charm_state.CharmState,
+):
+    """
+    arrange: Prepare CharmState with planner relation config.
+    act: Call create_application_configuration.
+    assert: Planner endpoint/token are passed to ApplicationConfiguration.
+    """
+    state = dataclasses.replace(
+        complete_charm_state,
+        planner_config=charm_state.PlannerConfig(
+            endpoint="http://planner.example.com",
+            token="planner-token-value",
+        ),
+    )
+
+    app_configuration = factories.create_application_configuration(state, "app_name", "unit_name")
+
+    assert str(app_configuration.planner_url) == "http://planner.example.com"
+    assert app_configuration.planner_token == "planner-token-value"

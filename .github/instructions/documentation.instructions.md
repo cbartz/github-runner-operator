@@ -30,7 +30,7 @@ The top-level `docs` directory should contain an overview or home page called `i
 
 The rest of the documentation follows the Diataxis framework consisting of four categories of documentation:
 
-1. **Tutorials**: A practice lesson that walks a user through a learning experience. Tutorials should be placed in the `docs/tutorial` directory, but sometimes they're placed in the top-level `docs` direcotry.
+1. **Tutorials**: A practice lesson that walks a user through a learning experience. Tutorials should be placed in the `docs/tutorial` directory, but sometimes they're placed in the top-level `docs` directory.
 2. **How-to guides**: Addresses real-world goals or problems by providing practical directions. How-to guides should be placed in the `docs/how-to` directory.
 3. **Reference**: Contains technical descriptions of theoretical knowledge. Reference documents should be placed in the `docs/reference` directory.
 4. **Explanation**: Provides context and background on topics for the user to understand the bigger picture. Explanation documents should be placed in the `docs/explanation` directory.
@@ -58,7 +58,7 @@ The tutorial should contain the following pieces:
   provide information on the supported architecture(s) like AMD64 or ARM64.
   Also include additional information if the
   tutorial will require significant resources (CPU, RAM, or disk space). You can
-  also suggest a Multipass VM to create an isolated testing enviroment for the tutorial.
+  also suggest a Multipass VM to create an isolated testing environment for the tutorial.
 - **Set up tutorial model**. The tutorial should begin at this point. Have
   the user create Juju model with a predetermined name so that you can reference
   the model name throughout the tutorial.
@@ -90,11 +90,10 @@ concisely summarize the real-world problem addressed by the document.
 problem or achieve the goal.
 - Provide instructions or tasks that the user can take to achieve the goal. Avoid gerunds.
 
-
 ## Style guide pointers
 
 - **Spelling**: Use US English for spelling suggestions.
-- **Headings**: Use sentence case for headings. Avoid punctuation in headings. Do not skip levels in heading hierarchy. Do not use consecutive headings without intervening text, and suggest removing headings that don't enhance the understanding. Don't overuse `code` styling in headings.
+- **Headings**: Use sentence case for headings, while preserving the capitalization of proper nouns, product names, and established terms. Avoid punctuation in headings. Do not skip levels in the heading hierarchy or place headings consecutively without intervening text. Use headings to help readers navigate and understand the page structure; avoid generic headings such as "Overview" when the opening text already introduces the topic. Read the headings as an outline: together, they should give readers a clear map of the page. Don't overuse `code` styling in headings.
 - **Code examples**: Do not use prompt marks (for example, `$` or `#`) in code examples. Do not use comments in code examples; instead, put any comments directly into the text. Whenever possible, split up multiple commands into separate code blocks and provide explanations in between the code blocks. Use Git-flavoured Markdown with fenced code blocks (```) and command examples as shell blocks.
 - **Lists**: Only use numbered lists when there is an inherent order to the items.
 - **Latin words and phrases**: We can't assume the reader is familiar with Latin words and phrases. Words such as "etc.", "i.e.", "e.g.", "per", "versus", and "via" should be avoided. 
@@ -112,5 +111,4 @@ If you modify a procedure (commands, required versions, prerequisites) and a `do
 If you add a new file into `docs`, add a short note in `docs/changelog.md` summarizing the user-facing change.
 
 If there are no user-relevant changes, then the changelog does not need to be updated.
-
 
